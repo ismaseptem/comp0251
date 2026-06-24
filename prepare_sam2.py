@@ -128,7 +128,7 @@ def prepare(dcm_dir: Path, label_path: Path, output_dir: Path):
 
         if has_mask:
             mask_png = (mask_slice * 255).astype(np.uint8)
-            cv2.imwrite(str(masks_dir / frame_name), mask_png)
+            cv2.imwrite(str(masks_dir / frame_name.replace(".jpg", ".png")), mask_png)
             n_prompt_frames += 1
 
         csv_rows.append({

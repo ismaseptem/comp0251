@@ -18,7 +18,7 @@ LABEL="/home/ucabia4/comp0251/test01.nii.gz"       # original label file for spa
 OUTPUT="/home/ucabia4/comp0251/propagated_label.nrrd"
 MODEL="large"                       # tiny | small | base_plus | large
 BATCH_SIZE=16                       # increase on A100/V100; reduce if OOM
-SLICE_RESULTS="/home/ucabia4/comp0251"  # set to "" to skip per-slice PNGs
+SLICE_RESULTS="/home/ucabia4/comp0251/slice_01/"  # set to "" to skip per-slice PNGs
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module purge
