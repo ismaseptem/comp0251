@@ -393,7 +393,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Propagate tumour masks across MRI slices with SAM2."
     )
-    parser.add_argument("--sam2-dir",   default="sam2_test/sam2",
+    parser.add_argument("--sam2-dir",   default="sam2",
                         help="Path to the sam2 repo (default: sam2_test/sam2)")
     parser.add_argument("--input-dir",  default="sam2_input",
                         help="Directory with frames/ and masks/ (default: sam2_input)")
