@@ -287,7 +287,7 @@ def propagate(
     predictor = load_predictor(sam2_dir, model, device)
 
     if device.type == "cuda":
-        torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+        predictor = predictor.to(torch.bfloat16)
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
