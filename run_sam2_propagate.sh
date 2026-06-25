@@ -7,7 +7,7 @@
 #$ -l tmpfs=20G
 #$ -pe smp 4
 #$ -j y
-#$ -o /home/ucabia4/comp0251/logs/sam2_propagate_$JOB_ID.log
+#$ -o logs/sam2_propagate_$JOB_ID.log
 #$ -cwd
 
 # ── User-defined paths (edit these) ──────────────────────────────────────────
