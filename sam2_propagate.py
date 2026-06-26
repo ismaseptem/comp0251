@@ -291,6 +291,9 @@ def propagate(
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+    elif device.type == "cpu":
+        # SAM2 produces bfloat16 intermediates even on CPU; autocast keeps dtypes consistent
+        torch.autocast("cpu", dtype=torch.bfloat16).__enter__()
     elif device.type == "mps":
         # MPS doesn't support bfloat16; float16 autocast avoids the MPS
         # dtype-mismatch assertion in MPSNDArrayMatrixMultiplication
