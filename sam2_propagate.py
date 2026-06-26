@@ -22,6 +22,7 @@ Usage
 """
 
 import argparse
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -287,60 +288,61 @@ def propagate(
     predictor = load_predictor(sam2_dir, model, device)
 
     if device.type == "cuda":
-        predictor = predictor.to(torch.bfloat16)
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
     elif device.type == "mps":
-        # MPS doesn't support bfloat16; float16 autocast avoids the MPS
-        # dtype-mismatch assertion in MPSNDArrayMatrixMultiplication
-        torch.autocast("mps", dtype=torch.float16).__enter__()
+        autocast_ctx = torch.autocast("mps", dtype=torch.float16)
+    else:
+        autocast_ctx = contextlib.nullcontext()
 
     # ── Init state (loads all frames once; reset_state reuses them) ───────
     offload = device.type != "cuda"
-    inference_state = predictor.init_state(
-        video_path=str(frames_dir),
-        offload_video_to_cpu=offload,
-        async_loading_frames=False,
-    )
-    n_frames = inference_state["num_frames"]
-    print(f"\nVideo frames loaded: {n_frames}")
+    with autocast_ctx:
+        inference_state = predictor.init_state(
+            video_path=str(frames_dir),
+            offload_video_to_cpu=offload,
+            async_loading_frames=False,
+        )
+        n_frames = inference_state["num_frames"]
+        print(f"\nVideo frames loaded: {n_frames}")
 
-    # ── Batched propagation ───────────────────────────────────────────────
-    # MPS crashes when all objects are batched together; process in small
-    # groups, resetting tracking state between batches (images stay loaded).
-    all_obj_ids = sorted({oid for objs in assignments.values() for oid in objs})
-    n_batches   = (len(all_obj_ids) + batch_size - 1) // batch_size
-    all_segs    = {f: {} for f in range(n_frames)}
+        # ── Batched propagation ───────────────────────────────────────────────
+        # MPS crashes when all objects are batched together; process in small
+        # groups, resetting tracking state between batches (images stay loaded).
+        all_obj_ids = sorted({oid for objs in assignments.values() for oid in objs})
+        n_batches   = (len(all_obj_ids) + batch_size - 1) // batch_size
+        all_segs    = {f: {} for f in range(n_frames)}
 
-    for batch_num, batch_start in enumerate(range(0, len(all_obj_ids), batch_size)):
-        batch_ids = set(all_obj_ids[batch_start : batch_start + batch_size])
-        print(f"\n[Batch {batch_num + 1}/{n_batches}] objects {sorted(batch_ids)}")
+        for batch_num, batch_start in enumerate(range(0, len(all_obj_ids), batch_size)):
+            batch_ids = set(all_obj_ids[batch_start : batch_start + batch_size])
+            print(f"\n[Batch {batch_num + 1}/{n_batches}] objects {sorted(batch_ids)}")
 
-        predictor.reset_state(inference_state)   # clears tracking, keeps images
+            predictor.reset_state(inference_state)   # clears tracking, keeps images
 
-        # Add prompts for this batch
-        for frame_idx, obj_masks in sorted(assignments.items()):
-            for obj_id, mask in obj_masks.items():
-                if obj_id in batch_ids:
-                    predictor.add_new_mask(inference_state, frame_idx, obj_id, mask)
-                    print(f"  frame {frame_idx:2d}  obj {obj_id:3d}  ({mask.sum()} px)")
+            # Add prompts for this batch
+            for frame_idx, obj_masks in sorted(assignments.items()):
+                for obj_id, mask in obj_masks.items():
+                    if obj_id in batch_ids:
+                        predictor.add_new_mask(inference_state, frame_idx, obj_id, mask)
+                        print(f"  frame {frame_idx:2d}  obj {obj_id:3d}  ({mask.sum()} px)")
 
-        # Forward: earliest prompt → last frame
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-            inference_state
-        ):
-            for i, oid in enumerate(out_obj_ids):
-                m = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                _merge_seg(all_segs, out_frame_idx, oid, m)
+            # Forward: earliest prompt → last frame
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state
+            ):
+                for i, oid in enumerate(out_obj_ids):
+                    m = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                    _merge_seg(all_segs, out_frame_idx, oid, m)
 
-        # Backward: earliest prompt → frame 0
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-            inference_state, reverse=True
-        ):
-            for i, oid in enumerate(out_obj_ids):
-                m = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                _merge_seg(all_segs, out_frame_idx, oid, m)
+            # Backward: earliest prompt → frame 0
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state, reverse=True
+            ):
+                for i, oid in enumerate(out_obj_ids):
+                    m = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
+                    _merge_seg(all_segs, out_frame_idx, oid, m)
 
     # ── Optional per-slice result images ─────────────────────────────────
     if slice_results_dir is not None:
