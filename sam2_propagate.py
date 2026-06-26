@@ -291,6 +291,7 @@ def propagate(
         if torch.cuda.get_device_properties(0).major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            predictor = predictor.to(torch.bfloat16)
         autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
     elif device.type == "mps":
         autocast_ctx = torch.autocast("mps", dtype=torch.float16)
