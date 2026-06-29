@@ -396,12 +396,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Propagate tumour masks across MRI slices with SAM2."
     )
-    parser.add_argument("--sam2-dir",   default="sam2",
+    parser.add_argument("--sam2-dir",   default="sam2_test/sam2",
                         help="Path to the sam2 repo (default: sam2_test/sam2)")
     parser.add_argument("--input-dir",  default="sam2_input",
                         help="Directory with frames/ and masks/ (default: sam2_input)")
-    parser.add_argument("--label",      required=True,
-                        help="Original label file for spatial metadata (.nii.gz or .nrrd)")
+    parser.add_argument("--label",      default=None,
+                        help="Reference file for spatial metadata (.nii.gz or .nrrd). "
+                             "Defaults to <input-dir>/reference.nii.gz written by prepare_sam2.py.")
     parser.add_argument("--output",     default="propagated_label.nrrd",
                         help="Output NRRD path (default: propagated_label.nrrd)")
     parser.add_argument("--model",      default="large",
@@ -415,10 +416,13 @@ if __name__ == "__main__":
                              "directory (mirrors build_volume / extracter output).")
     args = parser.parse_args()
 
+    input_dir  = Path(args.input_dir)
+    label_path = Path(args.label) if args.label else input_dir / "reference.nii.gz"
+
     propagate(
         sam2_dir=Path(args.sam2_dir),
-        input_dir=Path(args.input_dir),
-        label_path=Path(args.label),
+        input_dir=input_dir,
+        label_path=label_path,
         output_path=Path(args.output),
         model=args.model,
         batch_size=args.batch_size,
