@@ -13,12 +13,12 @@
 # ── User-defined paths (edit these) ──────────────────────────────────────────
 CONDA_ENV="comp0251"           # name of your conda environment
 SAM2_DIR="/home/ucabia4/sam2"            # root of the SAM2 repo clone
-INPUT_DIR="/home/ucabia4/comp0251/sam2_input_test01"     # directory with frames/ and masks/ subdirs
+INPUT_DIR="/home/ucabia4/comp0251/sam2_input_test04"     # directory with frames/ and masks/ subdirs
 LABEL="/home/ucabia4/comp0251/test01.nii.gz"       # original label file for spatial metadata
-OUTPUT="/home/ucabia4/comp0251/propagated_label.nrrd"
+OUTPUT="/home/ucabia4/comp0251/propagated_label_test04.nrrd"
 MODEL="large"                       # tiny | small | base_plus | large
 BATCH_SIZE=16                       # increase on A100/V100; reduce if OOM
-SLICE_RESULTS="/home/ucabia4/comp0251/slice_01/"  # set to "" to skip per-slice PNGs
+SLICE_RESULTS="/home/ucabia4/comp0251/slice_04/"  # set to "" to skip per-slice PNGs
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module purge
