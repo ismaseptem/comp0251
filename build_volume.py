@@ -56,7 +56,7 @@ def instance_from_dcm(path: Path) -> int:
 # ─────────────────────────── Per-slice extraction ────────────────────────
 
 def extract_mask(dcm_path: Path, target_hw: tuple[int, int],
-                 results_dir: Path) -> np.ndarray:
+                 results_dir: Path | None) -> np.ndarray:
     """
     Run the extracter pipeline on one annotated DICOM (RGB Secondary Capture).
     Returns a uint8 binary mask (0/1) resampled to target_hw = (H, W).
@@ -84,7 +84,7 @@ def extract_mask(dcm_path: Path, target_hw: tuple[int, int],
 
 # ─────────────────────────── Main ────────────────────────────────────────
 
-def build_volume(dcm_dir: Path, output_path: Path):
+def build_volume(dcm_dir: Path, output_path: Path, slice_results: Path | None = None):
     print(f"\nReading annotated DICOM series from: {dcm_dir}")
     ref_image, slice_map = read_dicom_series(dcm_dir)
 
@@ -106,8 +106,9 @@ def build_volume(dcm_dir: Path, output_path: Path):
 
     target_hw    = (dcm_h, dcm_w)
     label_volume = np.zeros((n_slices, dcm_h, dcm_w), dtype=np.uint8)
-    results_dir  = output_path.parent / "slice_results"
-    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if slice_results is not None:
+        slice_results.mkdir(parents=True, exist_ok=True)
 
     n_annotated = 0
     print()
@@ -118,7 +119,7 @@ def build_volume(dcm_dir: Path, output_path: Path):
             print(f"  slice {slice_idx:3d}  inst={inst_num:4d}  [no DCM — blank]")
             continue
 
-        mask = extract_mask(dcm_path, target_hw, results_dir)
+        mask = extract_mask(dcm_path, target_hw, slice_results)
         label_volume[slice_idx] = mask
 
         has_ann = bool(mask.any())
@@ -129,7 +130,8 @@ def build_volume(dcm_dir: Path, output_path: Path):
               + (f"  tumours≈{n_regions}" if has_ann else ""))
 
     print(f"\nAnnotated slices : {n_annotated} / {n_slices}")
-    print(f"Per-slice results: {results_dir}/")
+    if slice_results is not None:
+        print(f"Per-slice results: {slice_results}/")
 
     label_img = sitk.GetImageFromArray(label_volume)
     label_img.SetSpacing(spacing)
@@ -158,9 +160,12 @@ if __name__ == "__main__":
                         help="Folder of annotated DICOM files")
     parser.add_argument("--output", "-o", default="label.nrrd",
                         help="Output NRRD path (default: label.nrrd)")
+    parser.add_argument("--slice-results", default=None,
+                        help="Directory to save per-slice detection PNGs (optional)")
     args = parser.parse_args()
 
     build_volume(
         dcm_dir=Path(args.dcm_dir),
         output_path=Path(args.output),
+        slice_results=Path(args.slice_results) if args.slice_results else None,
     )
