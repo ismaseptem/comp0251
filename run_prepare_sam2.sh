@@ -12,10 +12,11 @@
 
 # ── User-defined paths (edit these) ──────────────────────────────────────────
 CONDA_ENV="comp0251"
-DCM_DIR="/home/ucabia4/comp0251/brac46551b_5316"  # annotated DICOM folder
-SAM2_DIR="/home/ucabia4/sam2"                      # root of the SAM2 repo clone
-OUTPUT_DIR="/home/ucabia4/comp0251/sam2_input"     # written here; pass same path to run_sam2_propagate.sh
-MODEL="large"                                      # tiny | small | base_plus | large
+ROI_DCM_DIR="/home/ucabia4/comp0251/brac46551b_roi"   # annotated (ROI) DICOMs — crosshair detection
+RAW_DCM_DIR="/home/ucabia4/comp0251/brac46551b_raw"    # unannotated (raw) DICOMs — frames + SAM2
+SAM2_DIR="/home/ucabia4/sam2"                          # root of the SAM2 repo clone
+OUTPUT_DIR="/home/ucabia4/comp0251/sam2_input_test03"         # written here; pass same path to run_sam2_propagate.sh
+MODEL="large"                                          # tiny | small | base_plus | large
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module purge
@@ -40,10 +41,11 @@ mkdir -p logs
 
 # ── Generate SAM2-predicted seed masks from annotated DICOMs ─────────────────
 python prepare_sam2.py \
-    --dcm-dir   "$DCM_DIR" \
-    --sam2-dir  "$SAM2_DIR" \
-    --output    "$OUTPUT_DIR" \
-    --model     "$MODEL"
+    --roi-dcm-dir  "$ROI_DCM_DIR" \
+    --raw-dcm-dir  "$RAW_DCM_DIR" \
+    --sam2-dir     "$SAM2_DIR" \
+    --output       "$OUTPUT_DIR" \
+    --model        "$MODEL"
 
 echo "==== Done: $(date) ===="
 echo "Inspect masks in $OUTPUT_DIR/masks/ before running run_sam2_propagate.sh"

@@ -3,25 +3,23 @@
 prepare_sam2.py  —  Build SAM2 propagation inputs from annotated DICOMs
 -----------------------------------------------------------------------
 For each slice in the DICOM series:
-  1. Converts the raw image to an 8-bit RGB JPEG (SAM2 video frame).
-  2. Detects crosshair annotations with extracter.py.
-  3. If crosshairs are found, runs SAM2's *image* predictor on that slice:
+  1. Reads the clean frame from the raw (unannotated) DICOM series.
+  2. Detects crosshair annotations from the matching ROI (annotated) DICOM.
+  3. If crosshairs are found, runs SAM2's *image* predictor on the clean frame:
        - crosshair centre  → positive point prompt
        - arm extent (AABB) → bounding-box constraint  (when arms are long enough)
-     This replaces the old ellipse-mask approach, which produced masks whose
-     size was unreliable because arm lengths were inconsistent across annotators.
+     Using the raw frame (no annotation lines) prevents SAM2 from segmenting
+     the crosshair marks themselves instead of the underlying tumour tissue.
   4. Saves the resulting pixel-accurate mask as a PNG prompt for sam2_propagate.py.
   5. Writes frame_info.csv and a reference NIfTI (spatial metadata for propagation).
-
-Replaces the old two-step chain:
-    build_volume.py → label.nii.gz → old prepare_sam2.py
 
 Usage
 -----
     python prepare_sam2.py \\
-        --dcm-dir  brac46551b_5316 \\
-        --sam2-dir sam2_test/sam2 \\
-        --output   sam2_input/
+        --roi-dcm-dir  brac46551b_5316 \\
+        --raw-dcm-dir  brac46551b_raw \\
+        --sam2-dir     sam2_test/sam2 \\
+        --output       sam2_input/
 
     # Faster image-predictor model:
     python prepare_sam2.py ... --model small
@@ -102,6 +100,17 @@ def dcm_to_rgb(path: Path) -> np.ndarray:
     else:
         arr = arr.astype(np.uint8)
     return arr
+
+
+def build_roi_index(roi_dcm_dir: Path) -> dict:
+    """Return {instance_number: Path} for every DICOM in the ROI folder."""
+    index = {}
+    for p in roi_dcm_dir.iterdir():
+        if p.suffix.lower() == ".dcm":
+            ds = pydicom.dcmread(str(p), stop_before_pixels=True)
+            inst = int(getattr(ds, "InstanceNumber", 0))
+            index[inst] = p
+    return index
 
 
 def build_reference_nifti(dcm_dir: Path) -> sitk.Image:
@@ -223,8 +232,8 @@ def predict_mask_for_crosshair(predictor, ch: dict, h: int, w: int) -> np.ndarra
 
 # ─────────────────────────── Main ────────────────────────────────────────────
 
-def prepare(dcm_dir: Path, sam2_dir: Path, output_dir: Path,
-            model: str = "large", jpeg_quality: int = 95):
+def prepare(roi_dcm_dir: Path, raw_dcm_dir: Path, sam2_dir: Path,
+            output_dir: Path, model: str = "large", jpeg_quality: int = 95):
 
     frames_dir = output_dir / "frames"
     masks_dir  = output_dir / "masks"
@@ -235,9 +244,13 @@ def prepare(dcm_dir: Path, sam2_dir: Path, output_dir: Path,
     sys.path.insert(0, str(Path(__file__).parent))
 
     device      = select_device()
-    slice_order = read_series_order(dcm_dir)
+    # Slice ordering and spatial metadata come from the raw series
+    slice_order = read_series_order(raw_dcm_dir)
     n_slices    = len(slice_order)
     pad         = len(str(n_slices - 1))
+
+    # ROI DICOMs indexed by instance number for fast lookup
+    roi_index = build_roi_index(roi_dcm_dir)
 
     predictor = load_image_predictor(sam2_dir, model, device)
 
@@ -258,11 +271,11 @@ def prepare(dcm_dir: Path, sam2_dir: Path, output_dir: Path,
     print(f"\nProcessing {n_slices} slices → {output_dir}/")
 
     with autocast_ctx:
-        for slice_idx, inst_num, dcm_path in slice_order:
+        for slice_idx, inst_num, raw_path in slice_order:
             stem = f"{slice_idx:0{pad}d}"
 
-            # ── Frame image ──────────────────────────────────────────────────
-            rgb = dcm_to_rgb(dcm_path)
+            # ── Frame image (clean, no annotation lines) ──────────────────────
+            rgb = dcm_to_rgb(raw_path)
             h, w = rgb.shape[:2]
             cv2.imwrite(
                 str(frames_dir / f"{stem}.jpg"),
@@ -270,11 +283,13 @@ def prepare(dcm_dir: Path, sam2_dir: Path, output_dir: Path,
                 [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
             )
 
-            # ── Detect crosshairs ────────────────────────────────────────────
-            crosshairs = detect_crosshairs(rgb)
+            # ── Detect crosshairs from ROI DICOM ─────────────────────────────
+            roi_path   = roi_index.get(inst_num)
+            crosshairs = detect_crosshairs(dcm_to_rgb(roi_path)) if roi_path else []
             has_mask   = len(crosshairs) > 0
 
             if has_mask:
+                # Set the clean frame — SAM2 segments tissue, not annotation lines
                 predictor.set_image(rgb)
 
                 combined = np.zeros((h, w), dtype=bool)
@@ -299,7 +314,7 @@ def prepare(dcm_dir: Path, sam2_dir: Path, output_dir: Path,
             print(f"  [{stem}]  inst={inst_num:4d}  {status}")
 
     # ── Reference NIfTI (spatial metadata for sam2_propagate.py) ─────────────
-    ref_nifti = build_reference_nifti(dcm_dir)
+    ref_nifti = build_reference_nifti(raw_dcm_dir)
     ref_path  = output_dir / "reference.nii.gz"
     sitk.WriteImage(ref_nifti, str(ref_path))
     print(f"\nReference NIfTI  : {ref_path}")
@@ -329,8 +344,10 @@ if __name__ == "__main__":
             "SAM2 image predictor."
         )
     )
-    parser.add_argument("--dcm-dir",  required=True,
-                        help="Folder of annotated DICOM files")
+    parser.add_argument("--roi-dcm-dir", required=True,
+                        help="Folder of annotated (ROI) DICOM files — used for crosshair detection")
+    parser.add_argument("--raw-dcm-dir", required=True,
+                        help="Folder of raw (unannotated) DICOM files — used for frame images and SAM2")
     parser.add_argument("--sam2-dir", default="sam2_test/sam2",
                         help="Path to SAM2 repo root (default: sam2_test/sam2)")
     parser.add_argument("--output",   default="sam2_input",
@@ -343,7 +360,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     prepare(
-        dcm_dir=Path(args.dcm_dir),
+        roi_dcm_dir=Path(args.roi_dcm_dir),
+        raw_dcm_dir=Path(args.raw_dcm_dir),
         sam2_dir=Path(args.sam2_dir),
         output_dir=Path(args.output),
         model=args.model,
