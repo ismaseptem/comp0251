@@ -19,6 +19,7 @@ OUTPUT="/home/ucabia4/comp0251/propagated_label_test04.nrrd"
 MODEL="large"                       # tiny | small | base_plus | large
 MAX_AREA_RATIO=2.0                  # reject propagated masks > N× seed area
 MAX_DRIFT=150                       # reject propagated masks whose centroid drifts > N px
+MIN_COMP_PX=200                     # remove connected components smaller than N px
 SLICE_RESULTS="/home/ucabia4/comp0251/slice_04/"  # set to "" to skip per-slice PNGs
 
 # ── Environment ───────────────────────────────────────────────────────────────
@@ -52,6 +53,7 @@ ARGS=(
     --model         "$MODEL"
     --max-area-ratio "$MAX_AREA_RATIO"
     --max-drift     "$MAX_DRIFT"
+    --min-comp-px   "$MIN_COMP_PX"
 )
 
 if [ -n "$SLICE_RESULTS" ]; then

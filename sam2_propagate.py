@@ -80,12 +80,24 @@ def load_seed_components(mask_path: Path) -> list[np.ndarray]:
     return [comp.astype(bool) for comp, _ in components_with_centroids(binary)]
 
 
+def remove_small_components(mask: np.ndarray, min_px: int) -> np.ndarray:
+    """Remove connected components smaller than min_px pixels from a bool mask."""
+    n_cc, cc_map = cv2.connectedComponents(mask.astype(np.uint8))
+    clean = np.zeros_like(mask)
+    for lbl in range(1, n_cc):
+        comp = cc_map == lbl
+        if int(comp.sum()) >= min_px:
+            clean |= comp
+    return clean
+
+
 def filter_seed_results(
     raw: dict,
     seed_frame_idx: int,
     comp_masks: list[np.ndarray],
     max_area_ratio: float,
     max_drift: float,
+    min_comp_px: int = 200,
 ) -> dict:
     """
     Keep only propagated masks that are plausible extensions of the seed.
@@ -93,12 +105,13 @@ def filter_seed_results(
     Rules applied to every non-seed frame:
       - Area  ≤ max_area_ratio × seed component area
       - Centroid within max_drift pixels of seed centroid
+      - Connected components < min_comp_px pixels are stripped (removes
+        spurious tiny fragments that accumulate when OR-ing many seeds)
 
     The seed frame itself is always kept unchanged (it is ground-truth).
 
     Returns {frame_idx: binary_bool_mask}.
     """
-    # Pre-compute per-component seed stats
     seed_stats = []
     for m in comp_masks:
         area = int(m.sum())
@@ -113,13 +126,13 @@ def filter_seed_results(
     for frame_idx, obj_masks in raw.items():
         frame_bin = None
         for lid, prop_mask in obj_masks.items():
-            idx = lid - 1       # comp_masks is 0-indexed, obj ids are 1-indexed
+            idx = lid - 1
             if idx >= len(seed_stats) or not prop_mask.any():
                 continue
             ss = seed_stats[idx]
 
             if frame_idx == seed_frame_idx:
-                keep = True     # seed frame is always ground-truth
+                keep = True
             else:
                 area = int(prop_mask.sum())
                 if area > max_area_ratio * ss["area"]:
@@ -128,6 +141,10 @@ def filter_seed_results(
                     ys, xs = np.where(prop_mask)
                     drift = np.hypot(xs.mean() - ss["cx"], ys.mean() - ss["cy"])
                     keep = drift <= max_drift
+
+                if keep:
+                    prop_mask = remove_small_components(prop_mask, min_comp_px)
+                    keep = prop_mask.any()
 
             if keep:
                 frame_bin = prop_mask if frame_bin is None else (frame_bin | prop_mask)
@@ -268,6 +285,7 @@ def propagate(
     model: str = "large",
     max_area_ratio: float = 2.0,
     max_drift: float = 150.0,
+    min_comp_px: int = 200,
     slice_results_dir: Path | None = None,
 ):
     device     = select_device()
@@ -352,12 +370,17 @@ def propagate(
 
         # Filter and accumulate
         filtered = filter_seed_results(raw, seed_frame_idx, comp_masks,
-                                       max_area_ratio, max_drift)
+                                       max_area_ratio, max_drift, min_comp_px)
         covered = 0
         for frame_idx, bin_mask in filtered.items():
             all_binary[frame_idx] |= bin_mask
             covered += 1
         print(f"  → frames covered after filtering: {covered}")
+
+    # ── Final cleanup: remove tiny fragments that survived OR-merging ────
+    for f in range(n_frames):
+        if all_binary[f].any():
+            all_binary[f] = remove_small_components(all_binary[f], min_comp_px)
 
     # ── Optional per-slice result images ─────────────────────────────────
     if slice_results_dir is not None:
@@ -427,6 +450,10 @@ if __name__ == "__main__":
     parser.add_argument("--max-drift", type=float, default=150.0,
                         help="Reject propagated masks whose centroid has drifted more "
                              "than this many pixels from the seed centroid (default: 150)")
+    parser.add_argument("--min-comp-px", type=int, default=200,
+                        help="Remove connected components smaller than this many pixels "
+                             "from propagated masks (default: 200). Eliminates spurious "
+                             "tiny fragments from SAM2 without affecting tumour regions.")
     parser.add_argument("--slice-results", default=None, metavar="DIR",
                         help="If set, save per-slice overlay + mask PNGs to this "
                              "directory (mirrors build_volume / extracter output).")
@@ -440,5 +467,6 @@ if __name__ == "__main__":
         model=args.model,
         max_area_ratio=args.max_area_ratio,
         max_drift=args.max_drift,
+        min_comp_px=args.min_comp_px,
         slice_results_dir=Path(args.slice_results) if args.slice_results else None,
     )

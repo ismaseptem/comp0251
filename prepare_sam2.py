@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
 """
-prepare_sam2.py — Convert annotated DICOM series + NIfTI label to SAM2 input
------------------------------------------------------------------------------
-Reads the annotated DICOM folder and a label NIfTI/NRRD file and writes:
+prepare_sam2.py — Convert raw MR DICOMs + NIfTI label to SAM2 input
+--------------------------------------------------------------------
+Reads the raw (unannotated) MR DICOM folder and a label NIfTI/NRRD built
+by build_volume.py (with --raw-dir), and writes:
 
   <output-dir>/
     frames/
-      00000.png   ← DCM slice 0 as RGB PNG  (SAM2 video frames)
-      00001.png
+      00.jpg   ← raw MR slice as RGB JPEG  (SAM2 video frames, no annotation overlay)
+      01.jpg
       ...
     masks/
-      00022.png   ← binary mask for annotated slice 22  (SAM2 prompts)
+      02.png   ← binary mask for annotated slice 2  (SAM2 prompts)
       ...
     frame_info.csv  ← frame_idx, instance_number, has_mask
 
 Usage
 -----
     python prepare_sam2.py \\
-        --dcm-dir brac46551b_5316 \\
+        --raw-dir brac46551b_raw/ \\
         --label   label.nii.gz \\
         --output  sam2_input/
 
-The frame index in the output matches the slice order used by build_volume.py
-(SimpleITK GDCM ordering, identical to the NIfTI/NRRD z-axis).
+Both --raw-dir and --label must be in the same MR space (produced from the
+same raw DICOM series). The frame index matches the SimpleITK GDCM slice
+order used by build_volume.py.
 """
 
 import argparse
@@ -158,18 +160,20 @@ def prepare(dcm_dir: Path, label_path: Path, output_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert annotated DICOM series + label NIfTI to SAM2 input format."
+        description="Convert raw MR DICOMs + label NIfTI to SAM2 video-predictor input format."
     )
-    parser.add_argument("--dcm-dir",  required=True,
-                        help="Folder of annotated DICOM files")
+    parser.add_argument("--raw-dir",  required=True,
+                        help="Folder of raw MR DICOM files (clean, no annotation overlay). "
+                             "These become the video frames fed to SAM2.")
     parser.add_argument("--label",    required=True,
-                        help="Label file produced by build_volume.py (.nii.gz or .nrrd)")
+                        help="Label NRRD/NIfTI produced by build_volume.py with --raw-dir. "
+                             "Must be in the same MR space as --raw-dir (256×226).")
     parser.add_argument("--output",   default="sam2_input",
                         help="Output directory (default: sam2_input/)")
     args = parser.parse_args()
 
     prepare(
-        dcm_dir=Path(args.dcm_dir),
+        dcm_dir=Path(args.raw_dir),
         label_path=Path(args.label),
         output_dir=Path(args.output),
     )
