@@ -71,67 +71,71 @@ def components_with_centroids(binary_mask: np.ndarray):
     return results
 
 
-def assign_object_ids(annotated_frames, masks_dir, max_gap=5, max_dist=120):
+def load_seed_components(mask_path: Path) -> list[np.ndarray]:
+    """Load a seed-frame mask PNG and return one bool array per connected component."""
+    raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if raw is None:
+        return []
+    binary = (raw > 127).astype(np.uint8)
+    return [comp.astype(bool) for comp, _ in components_with_centroids(binary)]
+
+
+def filter_seed_results(
+    raw: dict,
+    seed_frame_idx: int,
+    comp_masks: list[np.ndarray],
+    max_area_ratio: float,
+    max_drift: float,
+) -> dict:
     """
-    Build  {frame_idx: {obj_id: component_bool_mask}}  for every annotated frame.
+    Keep only propagated masks that are plausible extensions of the seed.
 
-    Cross-slice matching: if two consecutive annotated frames are within
-    `max_gap` slices, components whose centroids are within `max_dist` pixels
-    are considered the same tumour and share one obj_id.
+    Rules applied to every non-seed frame:
+      - Area  ≤ max_area_ratio × seed component area
+      - Centroid within max_drift pixels of seed centroid
 
-    Returns (assignments_dict, total_objects).
+    The seed frame itself is always kept unchanged (it is ground-truth).
+
+    Returns {frame_idx: binary_bool_mask}.
     """
-    assignments  = {}
-    next_id      = 1
-    prev_idx     = None
-    prev_comps   = {}          # {obj_id: centroid}
+    # Pre-compute per-component seed stats
+    seed_stats = []
+    for m in comp_masks:
+        area = int(m.sum())
+        ys, xs = np.where(m)
+        seed_stats.append({
+            "area": area,
+            "cx": float(xs.mean()) if area else 0.0,
+            "cy": float(ys.mean()) if area else 0.0,
+        })
 
-    for frame_idx in sorted(annotated_frames):
-        mask_path = masks_dir / f"{frame_idx:02d}.png"
-        if not mask_path.exists():
-            # try 3-digit padding
-            mask_path = masks_dir / f"{frame_idx:03d}.png"
-        raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if raw is None:
-            continue
-        binary = (raw > 127).astype(np.uint8)
+    result = {}
+    for frame_idx, obj_masks in raw.items():
+        frame_bin = None
+        for lid, prop_mask in obj_masks.items():
+            idx = lid - 1       # comp_masks is 0-indexed, obj ids are 1-indexed
+            if idx >= len(seed_stats) or not prop_mask.any():
+                continue
+            ss = seed_stats[idx]
 
-        comps = components_with_centroids(binary)
-
-        # Match each component to a previous obj_id or create a new one
-        gap_ok  = (prev_idx is not None) and (frame_idx - prev_idx <= max_gap)
-        used_prev = set()
-        frame_assignment = {}
-        curr_centroids   = {}
-
-        for comp, (cx, cy) in comps:
-            best_id   = None
-            best_dist = float("inf")
-
-            if gap_ok:
-                for pid, (px, py) in prev_comps.items():
-                    if pid in used_prev:
-                        continue
-                    d = np.hypot(cx - px, cy - py)
-                    if d < best_dist:
-                        best_dist = d
-                        best_id   = pid
-
-            if best_id is not None and best_dist <= max_dist:
-                obj_id = best_id
-                used_prev.add(obj_id)
+            if frame_idx == seed_frame_idx:
+                keep = True     # seed frame is always ground-truth
             else:
-                obj_id   = next_id
-                next_id += 1
+                area = int(prop_mask.sum())
+                if area > max_area_ratio * ss["area"]:
+                    keep = False
+                else:
+                    ys, xs = np.where(prop_mask)
+                    drift = np.hypot(xs.mean() - ss["cx"], ys.mean() - ss["cy"])
+                    keep = drift <= max_drift
 
-            frame_assignment[obj_id] = comp.astype(bool)
-            curr_centroids[obj_id]   = (cx, cy)
+            if keep:
+                frame_bin = prop_mask if frame_bin is None else (frame_bin | prop_mask)
 
-        assignments[frame_idx] = frame_assignment
-        prev_comps = curr_centroids
-        prev_idx   = frame_idx
+        if frame_bin is not None and frame_bin.any():
+            result[frame_idx] = frame_bin
 
-    return assignments, next_id - 1
+    return result
 
 
 # ─────────────────────────── SAM2 loader ─────────────────────────────────
@@ -262,12 +266,13 @@ def propagate(
     label_path: Path,
     output_path: Path,
     model: str = "large",
-    batch_size: int = 8,
+    max_area_ratio: float = 2.0,
+    max_drift: float = 150.0,
     slice_results_dir: Path | None = None,
 ):
-    device      = select_device()
-    frames_dir  = input_dir / "frames"
-    masks_dir   = input_dir / "masks"
+    device     = select_device()
+    frames_dir = input_dir / "frames"
+    masks_dir  = input_dir / "masks"
 
     # ── Discover annotated frames ─────────────────────────────────────────
     annotated_frames = sorted(
@@ -275,13 +280,8 @@ def propagate(
     )
     if not annotated_frames:
         raise FileNotFoundError(f"No mask PNGs found in {masks_dir}")
-    print(f"\nAnnotated frames: {annotated_frames}")
-
-    # ── Assign object ids to connected components ─────────────────────────
-    assignments, n_objects = assign_object_ids(annotated_frames, masks_dir)
-    print(f"Unique tumour objects: {n_objects}")
-    for fi, objs in sorted(assignments.items()):
-        print(f"  frame {fi:2d}: {list(objs.keys())}")
+    print(f"\nAnnotated frames : {annotated_frames}")
+    print(f"Filters          : max_area_ratio={max_area_ratio}  max_drift={max_drift}px")
 
     # ── Load SAM2 ─────────────────────────────────────────────────────────
     predictor = load_predictor(sam2_dir, model, device)
@@ -292,11 +292,8 @@ def propagate(
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
     elif device.type == "cpu":
-        # SAM2 produces bfloat16 intermediates even on CPU; autocast keeps dtypes consistent
         torch.autocast("cpu", dtype=torch.bfloat16).__enter__()
     elif device.type == "mps":
-        # MPS doesn't support bfloat16; float16 autocast avoids the MPS
-        # dtype-mismatch assertion in MPSNDArrayMatrixMultiplication
         torch.autocast("mps", dtype=torch.float16).__enter__()
 
     # ── Init state (loads all frames once; reset_state reuses them) ───────
@@ -307,60 +304,77 @@ def propagate(
         async_loading_frames=False,
     )
     n_frames = inference_state["num_frames"]
-    print(f"\nVideo frames loaded: {n_frames}")
+    print(f"Video frames loaded: {n_frames}")
 
-    # ── Batched propagation ───────────────────────────────────────────────
-    # MPS crashes when all objects are batched together; process in small
-    # groups, resetting tracking state between batches (images stay loaded).
-    all_obj_ids = sorted({oid for objs in assignments.values() for oid in objs})
-    n_batches   = (len(all_obj_ids) + batch_size - 1) // batch_size
-    all_segs    = {f: {} for f in range(n_frames)}
+    # Determine frame dimensions from a sample JPEG
+    sample_jpg = next(p for p in frames_dir.iterdir() if p.suffix in (".jpg", ".jpeg"))
+    H, W = cv2.imread(str(sample_jpg), cv2.IMREAD_GRAYSCALE).shape
 
-    for batch_num, batch_start in enumerate(range(0, len(all_obj_ids), batch_size)):
-        batch_ids = set(all_obj_ids[batch_start : batch_start + batch_size])
-        print(f"\n[Batch {batch_num + 1}/{n_batches}] objects {sorted(batch_ids)}")
+    # ── Per-seed-frame independent propagation ────────────────────────────
+    # Each annotated frame is propagated independently (forward + backward).
+    # Results are filtered by area and centroid proximity before OR-merging.
+    # This prevents an unusually large mask on one frame from biasing the
+    # propagation context for every other frame.
+    all_binary = np.zeros((n_frames, H, W), dtype=bool)
 
-        predictor.reset_state(inference_state)   # clears tracking, keeps images
+    for seed_num, seed_frame_idx in enumerate(annotated_frames):
+        mask_path = masks_dir / f"{seed_frame_idx:02d}.png"
+        if not mask_path.exists():
+            mask_path = masks_dir / f"{seed_frame_idx:03d}.png"
 
-        # Add prompts for this batch
-        for frame_idx, obj_masks in sorted(assignments.items()):
-            for obj_id, mask in obj_masks.items():
-                if obj_id in batch_ids:
-                    predictor.add_new_mask(inference_state, frame_idx, obj_id, mask)
-                    print(f"  frame {frame_idx:2d}  obj {obj_id:3d}  ({mask.sum()} px)")
+        comp_masks = load_seed_components(mask_path)
+        if not comp_masks:
+            print(f"\n[{seed_num+1}/{len(annotated_frames)}] frame {seed_frame_idx}: no valid components, skipping")
+            continue
 
-        # Forward: earliest prompt → last frame
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-            inference_state
-        ):
-            for i, oid in enumerate(out_obj_ids):
-                m = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                _merge_seg(all_segs, out_frame_idx, oid, m)
+        areas = [int(m.sum()) for m in comp_masks]
+        print(f"\n[{seed_num+1}/{len(annotated_frames)}] frame {seed_frame_idx}: "
+              f"{len(comp_masks)} component(s)  areas={areas}")
 
-        # Backward: earliest prompt → frame 0
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+        predictor.reset_state(inference_state)
+        for lid, m in enumerate(comp_masks, start=1):
+            predictor.add_new_mask(inference_state, seed_frame_idx, lid, m)
+
+        # Collect raw forward + backward results
+        raw = {f: {} for f in range(n_frames)}
+
+        for out_f, out_ids, out_logits in predictor.propagate_in_video(inference_state):
+            for i, oid in enumerate(out_ids):
+                m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
+                _merge_seg(raw, out_f, oid, m)
+
+        for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, reverse=True
         ):
-            for i, oid in enumerate(out_obj_ids):
-                m = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                _merge_seg(all_segs, out_frame_idx, oid, m)
+            for i, oid in enumerate(out_ids):
+                m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
+                _merge_seg(raw, out_f, oid, m)
+
+        # Filter and accumulate
+        filtered = filter_seed_results(raw, seed_frame_idx, comp_masks,
+                                       max_area_ratio, max_drift)
+        covered = 0
+        for frame_idx, bin_mask in filtered.items():
+            all_binary[frame_idx] |= bin_mask
+            covered += 1
+        print(f"  → frames covered after filtering: {covered}")
 
     # ── Optional per-slice result images ─────────────────────────────────
     if slice_results_dir is not None:
-        save_slice_results(frames_dir, all_segs, n_frames, slice_results_dir)
+        all_segs_vis = {f: {1: all_binary[f]}
+                        for f in range(n_frames) if all_binary[f].any()}
+        save_slice_results(frames_dir, all_segs_vis, n_frames, slice_results_dir)
 
     # ── Assemble output volumes ───────────────────────────────────────────
-    sample_jpg = next(p for p in frames_dir.iterdir() if p.suffix in (".jpg", ".jpeg"))
-    sample_img = cv2.imread(str(sample_jpg), cv2.IMREAD_GRAYSCALE)
-    H, W = sample_img.shape
+    binary_volume = all_binary.astype(np.uint8)
 
-    binary_volume   = np.zeros((n_frames, H, W), dtype=np.uint8)
+    # Instance volume: 2-D connected components per slice (consistent within
+    # each slice; IDs are not matched across slices)
     instance_volume = np.zeros((n_frames, H, W), dtype=np.uint16)
-
     for f in range(n_frames):
-        for oid, m in all_segs[f].items():
-            binary_volume[f]   |= m.astype(np.uint8)
-            instance_volume[f][m] = oid
+        if binary_volume[f].any():
+            n_cc, cc_map = cv2.connectedComponents(binary_volume[f])
+            instance_volume[f] = cc_map.astype(np.uint16)
 
     ann_before = len(annotated_frames)
     ann_after  = int(binary_volume.any(axis=(1, 2)).sum())
@@ -407,9 +421,12 @@ if __name__ == "__main__":
     parser.add_argument("--model",      default="large",
                         choices=["tiny", "small", "base_plus", "large"],
                         help="SAM2.1 model size (default: large)")
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="Objects per propagation batch (default: 8). "
-                             "Reduce to 4 if MPS crashes; raise to 16+ on CUDA.")
+    parser.add_argument("--max-area-ratio", type=float, default=2.0,
+                        help="Reject propagated masks whose area exceeds this multiple "
+                             "of the seed mask area (default: 2.0)")
+    parser.add_argument("--max-drift", type=float, default=150.0,
+                        help="Reject propagated masks whose centroid has drifted more "
+                             "than this many pixels from the seed centroid (default: 150)")
     parser.add_argument("--slice-results", default=None, metavar="DIR",
                         help="If set, save per-slice overlay + mask PNGs to this "
                              "directory (mirrors build_volume / extracter output).")
@@ -421,6 +438,7 @@ if __name__ == "__main__":
         label_path=Path(args.label),
         output_path=Path(args.output),
         model=args.model,
-        batch_size=args.batch_size,
+        max_area_ratio=args.max_area_ratio,
+        max_drift=args.max_drift,
         slice_results_dir=Path(args.slice_results) if args.slice_results else None,
     )
