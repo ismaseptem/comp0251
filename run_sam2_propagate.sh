@@ -13,14 +13,15 @@
 # ── User-defined paths (edit these) ──────────────────────────────────────────
 CONDA_ENV="comp0251"           # name of your conda environment
 SAM2_DIR="/home/ucabia4/sam2"            # root of the SAM2 repo clone
-INPUT_DIR="/home/ucabia4/comp0251/sam2_input_test04"     # directory with frames/ and masks/ subdirs
-LABEL="/home/ucabia4/comp0251/test01.nii.gz"       # original label file for spatial metadata
-OUTPUT="/home/ucabia4/comp0251/propagated_label_test04.nrrd"
+INPUT_DIR="/home/ucabia4/comp0251/sam2_input"     # directory with frames/ and masks/ subdirs
+LABEL="/home/ucabia4/comp0251/label.nii.gz"       # original label file for spatial metadata
+OUTPUT="/home/ucabia4/comp0251/propagated_label.nrrd"
 MODEL="large"                       # tiny | small | base_plus | large
-MAX_AREA_RATIO=2.0                  # reject propagated masks > N× seed area
+MAX_AREA_RATIO=1.1                  # reject propagated masks > N× seed area (seeds = max cross-section, so should only shrink)
 MAX_DRIFT=150                       # reject propagated masks whose centroid drifts > N px
 MIN_COMP_PX=200                     # remove connected components smaller than N px
-SLICE_RESULTS="/home/ucabia4/comp0251/slice_04/"  # set to "" to skip per-slice PNGs
+MAX_DEAD_FRAMES=5                   # stop propagating after N consecutive rejected frames
+SLICE_RESULTS="/home/ucabia4/comp0251/sam2_slices/"  # set to "" to skip per-slice PNGs
 
 # ── Environment ───────────────────────────────────────────────────────────────
 module purge
@@ -54,6 +55,7 @@ ARGS=(
     --max-area-ratio "$MAX_AREA_RATIO"
     --max-drift     "$MAX_DRIFT"
     --min-comp-px   "$MIN_COMP_PX"
+    --max-dead-frames "$MAX_DEAD_FRAMES"
 )
 
 if [ -n "$SLICE_RESULTS" ]; then

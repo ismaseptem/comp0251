@@ -91,6 +91,34 @@ def remove_small_components(mask: np.ndarray, min_px: int) -> np.ndarray:
     return clean
 
 
+def _frame_passes_filter(
+    frame_masks: dict,
+    seed_stats: list[dict],
+    max_area_ratio: float,
+    max_drift: float,
+) -> bool:
+    """Return True if at least one object in frame_masks passes area+drift checks.
+
+    Used for inline early-termination during propagation; the full filter
+    (with min_comp_px cleanup) is still applied post-hoc via filter_seed_results.
+    """
+    for lid, prop_mask in frame_masks.items():
+        idx = lid - 1
+        if idx >= len(seed_stats) or not prop_mask.any():
+            continue
+        ss = seed_stats[idx]
+        area = int(prop_mask.sum())
+        if area > max_area_ratio * ss["area"]:
+            continue
+        ys, xs = np.where(prop_mask)
+        if not len(xs):
+            continue
+        drift = np.hypot(xs.mean() - ss["cx"], ys.mean() - ss["cy"])
+        if drift <= max_drift:
+            return True
+    return False
+
+
 def filter_seed_results(
     raw: dict,
     seed_frame_idx: int,
@@ -283,9 +311,10 @@ def propagate(
     label_path: Path,
     output_path: Path,
     model: str = "large",
-    max_area_ratio: float = 2.0,
+    max_area_ratio: float = 1.1,
     max_drift: float = 150.0,
     min_comp_px: int = 200,
+    max_dead_frames: int = 5,
     slice_results_dir: Path | None = None,
 ):
     device     = select_device()
@@ -299,7 +328,8 @@ def propagate(
     if not annotated_frames:
         raise FileNotFoundError(f"No mask PNGs found in {masks_dir}")
     print(f"\nAnnotated frames : {annotated_frames}")
-    print(f"Filters          : max_area_ratio={max_area_ratio}  max_drift={max_drift}px")
+    print(f"Filters          : max_area_ratio={max_area_ratio}  max_drift={max_drift}px  "
+          f"max_dead_frames={max_dead_frames}")
 
     # ── Load SAM2 ─────────────────────────────────────────────────────────
     predictor = load_predictor(sam2_dir, model, device)
@@ -353,20 +383,58 @@ def propagate(
         for lid, m in enumerate(comp_masks, start=1):
             predictor.add_new_mask(inference_state, seed_frame_idx, lid, m)
 
-        # Collect raw forward + backward results
+        # Seed stats used for both inline termination and post-hoc filtering
+        seed_stats = []
+        for m in comp_masks:
+            area = int(m.sum())
+            ys, xs = np.where(m)
+            seed_stats.append({
+                "area": area,
+                "cx": float(xs.mean()) if area else 0.0,
+                "cy": float(ys.mean()) if area else 0.0,
+            })
+
+        # Collect raw forward + backward results with early termination.
+        # If max_dead_frames consecutive non-seed frames all fail the area/drift
+        # filter, propagation is stopped early to prevent SAM2's hidden state
+        # from being corrupted by distant, anatomically-different frames.
         raw = {f: {} for f in range(n_frames)}
 
+        dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(inference_state):
+            frame_masks = {}
             for i, oid in enumerate(out_ids):
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
+                frame_masks[oid] = m
+            if out_f != seed_frame_idx:
+                if _frame_passes_filter(frame_masks, seed_stats, max_area_ratio, max_drift):
+                    dead = 0
+                else:
+                    dead += 1
+                    if dead >= max_dead_frames:
+                        print(f"  → Fwd early-stop at frame {out_f} "
+                              f"({dead} consecutive dead frames)")
+                        break
 
+        dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, reverse=True
         ):
+            frame_masks = {}
             for i, oid in enumerate(out_ids):
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
+                frame_masks[oid] = m
+            if out_f != seed_frame_idx:
+                if _frame_passes_filter(frame_masks, seed_stats, max_area_ratio, max_drift):
+                    dead = 0
+                else:
+                    dead += 1
+                    if dead >= max_dead_frames:
+                        print(f"  → Bwd early-stop at frame {out_f} "
+                              f"({dead} consecutive dead frames)")
+                        break
 
         # Filter and accumulate
         filtered = filter_seed_results(raw, seed_frame_idx, comp_masks,
@@ -444,9 +512,11 @@ if __name__ == "__main__":
     parser.add_argument("--model",      default="large",
                         choices=["tiny", "small", "base_plus", "large"],
                         help="SAM2.1 model size (default: large)")
-    parser.add_argument("--max-area-ratio", type=float, default=2.0,
+    parser.add_argument("--max-area-ratio", type=float, default=1.1,
                         help="Reject propagated masks whose area exceeds this multiple "
-                             "of the seed mask area (default: 2.0)")
+                             "of the seed mask area (default: 1.1). Seeds are the largest "
+                             "cross-section, so propagated slices should only get smaller; "
+                             "1.1 gives 10%% tolerance for segmentation imprecision.")
     parser.add_argument("--max-drift", type=float, default=150.0,
                         help="Reject propagated masks whose centroid has drifted more "
                              "than this many pixels from the seed centroid (default: 150)")
@@ -454,6 +524,10 @@ if __name__ == "__main__":
                         help="Remove connected components smaller than this many pixels "
                              "from propagated masks (default: 200). Eliminates spurious "
                              "tiny fragments from SAM2 without affecting tumour regions.")
+    parser.add_argument("--max-dead-frames", type=int, default=5,
+                        help="Stop propagating from a seed when this many consecutive "
+                             "frames all fail the area/drift filter (default: 5). "
+                             "Prevents SAM2 hidden-state corruption from distant frames.")
     parser.add_argument("--slice-results", default=None, metavar="DIR",
                         help="If set, save per-slice overlay + mask PNGs to this "
                              "directory (mirrors build_volume / extracter output).")
@@ -468,5 +542,6 @@ if __name__ == "__main__":
         max_area_ratio=args.max_area_ratio,
         max_drift=args.max_drift,
         min_comp_px=args.min_comp_px,
+        max_dead_frames=args.max_dead_frames,
         slice_results_dir=Path(args.slice_results) if args.slice_results else None,
     )

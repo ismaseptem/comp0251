@@ -278,6 +278,7 @@ tags
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,linux,python,visualstudiocode,venv,vim,virtualenv
 
+test*/
 output_test/
 output/
 sam2_input/

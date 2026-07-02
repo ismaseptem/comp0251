@@ -60,21 +60,24 @@ def read_series_order(dcm_dir: Path):
     return result
 
 
-def dcm_to_rgb(path: Path) -> np.ndarray:
-    """Read a DICOM file and return an 8-bit RGB numpy array (H × W × 3)."""
+def dcm_to_rgb(path: Path, lo: float | None = None, hi: float | None = None) -> np.ndarray:
+    """Read a DICOM file and return an 8-bit RGB numpy array (H × W × 3).
+
+    lo/hi: global intensity window bounds (1st/99th percentile of the whole volume).
+    If not provided, falls back to per-slice min/max (less consistent across frames).
+    """
     ds = pydicom.dcmread(str(path))
     arr = ds.pixel_array
 
     if arr.ndim == 2:
-        # Grayscale — window/level to 8-bit, then stack to RGB
         arr = arr.astype(np.float32)
-        lo, hi = arr.min(), arr.max()
-        if hi > lo:
-            arr = (arr - lo) / (hi - lo) * 255.0
+        w_lo = lo if lo is not None else arr.min()
+        w_hi = hi if hi is not None else arr.max()
+        if w_hi > w_lo:
+            arr = (arr - w_lo) / (w_hi - w_lo) * 255.0
         arr = arr.clip(0, 255).astype(np.uint8)
         arr = np.stack([arr, arr, arr], axis=-1)
     else:
-        # Already RGB (Secondary Capture)
         arr = arr.astype(np.uint8)
 
     return arr
@@ -111,6 +114,24 @@ def prepare(dcm_dir: Path, label_path: Path, output_dir: Path):
             "Make sure the label was built from the same DCM folder."
         )
 
+    # ── Global intensity window (1st–99th percentile across all slices) ──
+    # Per-slice min/max normalization makes each frame look different to SAM2
+    # (a mostly-fat slice vs a tumor-containing slice have different intensity
+    # ranges). A global window gives consistent appearance across the video.
+    print("\nComputing global intensity window …")
+    all_pixels = []
+    for _, _, dcm_path in slice_order:
+        ds = pydicom.dcmread(str(dcm_path))
+        px = ds.pixel_array
+        if px.ndim == 2:
+            all_pixels.append(px.ravel())
+    if all_pixels:
+        stacked = np.concatenate(all_pixels).astype(np.float32)
+        global_lo, global_hi = float(np.percentile(stacked, 1)), float(np.percentile(stacked, 99))
+        print(f"  Global window: [{global_lo:.1f}, {global_hi:.1f}]")
+    else:
+        global_lo, global_hi = None, None
+
     csv_rows = []
     n_prompt_frames = 0
 
@@ -119,7 +140,7 @@ def prepare(dcm_dir: Path, label_path: Path, output_dir: Path):
         frame_name = f"{slice_idx:0{pad}d}.jpg"
 
         # ── Frame image ──────────────────────────────────────────────────
-        rgb = dcm_to_rgb(dcm_path)
+        rgb = dcm_to_rgb(dcm_path, lo=global_lo, hi=global_hi)
         cv2.imwrite(str(frames_dir / frame_name),
                     cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
