@@ -343,6 +343,14 @@ def propagate(
     print(f"Filters          : max_area_ratio={max_area_ratio}  max_drift={max_drift}px  "
           f"max_dead_frames={max_dead_frames}")
 
+    # ── Spatial metadata (used for depth estimation and output writing) ───
+    ref = sitk.ReadImage(str(label_path))
+    spacing = ref.GetSpacing()          # (x_mm, y_mm, z_mm)
+    pixel_spacing_mm = (spacing[0] + spacing[1]) / 2.0
+    slice_thickness_mm = spacing[2]
+    print(f"Spacing          : in-plane={pixel_spacing_mm:.2f} mm  "
+          f"slice={slice_thickness_mm:.2f} mm")
+
     # ── Load SAM2 ─────────────────────────────────────────────────────────
     predictor = load_predictor(sam2_dir, model, device)
 
@@ -406,16 +414,31 @@ def propagate(
                 "cy": float(ys.mean()) if area else 0.0,
             })
 
+        # RECIST-based depth limit: assume tumour is roughly spherical, so its
+        # superior-inferior extent ≈ in-plane diameter. Max propagation depth
+        # (in slices, each direction) = diameter_mm / slice_thickness_mm.
+        # Take the max across components so the largest lesion dictates range;
+        # smaller components are still constrained per-frame by area/drift.
+        max_depth = 1
+        for ss in seed_stats:
+            area_mm2 = ss["area"] * pixel_spacing_mm ** 2
+            radius_mm = np.sqrt(area_mm2 / np.pi)   # seed is at equator → extends by radius each way
+            max_depth = max(max_depth, int(np.ceil(radius_mm / slice_thickness_mm)))
+        print(f"  Max depth (RECIST): ±{max_depth} slices")
+
         # Collect raw forward + backward results with early termination.
-        # If max_dead_frames consecutive non-seed frames all fail the area/drift
-        # filter, propagation is stopped early to prevent SAM2's hidden state
-        # from being corrupted by distant, anatomically-different frames.
+        # Propagation stops at max_depth slices from seed (RECIST geometry) or
+        # after max_dead_frames consecutive failures (tracking lost), whichever
+        # comes first.
         raw = {f: {} for f in range(n_frames)}
 
         dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, start_frame_idx=seed_frame_idx
         ):
+            if out_f > seed_frame_idx + max_depth:
+                print(f"  → Fwd depth limit at frame {out_f}")
+                break
             frame_masks = {}
             for i, oid in enumerate(out_ids):
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
@@ -435,6 +458,9 @@ def propagate(
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, start_frame_idx=seed_frame_idx, reverse=True
         ):
+            if out_f < seed_frame_idx - max_depth:
+                print(f"  → Bwd depth limit at frame {out_f}")
+                break
             frame_masks = {}
             for i, oid in enumerate(out_ids):
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
@@ -478,7 +504,7 @@ def propagate(
     instance_volume = np.zeros((n_frames, H, W), dtype=np.uint16)
     for f in range(n_frames):
         if binary_volume[f].any():
-            n_cc, cc_map = cv2.connectedComponents(binary_volume[f])
+            _, cc_map = cv2.connectedComponents(binary_volume[f])
             instance_volume[f] = cc_map.astype(np.uint16)
 
     ann_before = len(annotated_frames)
@@ -487,8 +513,6 @@ def propagate(
     print(f"Annotated slices after  propagation : {ann_after} / {n_frames}")
 
     # ── Write output volumes with original spatial metadata ───────────────
-    ref = sitk.ReadImage(str(label_path))
-
     def write_vol(arr, path, extra_meta=None):
         img = sitk.GetImageFromArray(arr.astype(np.uint16))
         img.CopyInformation(ref)
