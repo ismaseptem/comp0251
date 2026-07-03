@@ -6,8 +6,10 @@ Reads the frames/ and masks/ produced by prepare_sam2.py, runs SAM2 video
 propagation (forward + backward), and writes a propagated label volume.
 
 Connected components within each mask are each tracked as a separate SAM2
-object. Components across consecutive annotated slices are matched by
-centroid proximity so the same physical tumour keeps one object id.
+object. Each seed frame is propagated independently; results are filtered by
+area and centroid proximity then OR-merged into a single binary volume.
+Instance IDs in the output are assigned per-slice and are not matched across
+seeds or slices.
 
 Usage
 -----
@@ -49,18 +51,17 @@ def select_device():
 
 # ─────────────────────────── Connected-component helpers ─────────────────
 
-def components_with_centroids(binary_mask: np.ndarray):
+def components_with_centroids(binary_mask: np.ndarray, min_px: int = 50):
     """
     Return [(component_mask, centroid_xy), ...] for each foreground component.
-    Filters out components smaller than MIN_PX pixels.
+    Filters out components smaller than min_px pixels.
     """
-    MIN_PX = 50
     n, label_map = cv2.connectedComponents(binary_mask.astype(np.uint8))
     results = []
     for lbl in range(1, n):
         comp = (label_map == lbl).astype(np.uint8)
         px = int(comp.sum())
-        if px < MIN_PX:
+        if px < min_px:
             continue
         M = cv2.moments(comp)
         if M["m00"] == 0:
@@ -72,12 +73,16 @@ def components_with_centroids(binary_mask: np.ndarray):
 
 
 def load_seed_components(mask_path: Path) -> list[np.ndarray]:
-    """Load a seed-frame mask PNG and return one bool array per connected component."""
+    """Load a seed-frame mask PNG and return one bool array per connected component.
+
+    Uses min_px=20 so small but genuine ground-truth annotations are not
+    silently dropped (propagation results are still filtered at min_comp_px=200).
+    """
     raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if raw is None:
         return []
     binary = (raw > 127).astype(np.uint8)
-    return [comp.astype(bool) for comp, _ in components_with_centroids(binary)]
+    return [comp.astype(bool) for comp, _ in components_with_centroids(binary, min_px=20)]
 
 
 def remove_small_components(mask: np.ndarray, min_px: int) -> np.ndarray:
@@ -96,17 +101,27 @@ def _frame_passes_filter(
     seed_stats: list[dict],
     max_area_ratio: float,
     max_drift: float,
+    min_mask_px: int = 200,
 ) -> bool:
-    """Return True if at least one object in frame_masks passes area+drift checks.
+    """Return True if at least one object passes area, drift, and minimum-size checks.
 
-    Used for inline early-termination during propagation; the full filter
-    (with min_comp_px cleanup) is still applied post-hoc via filter_seed_results.
+    The minimum-size gate checks the largest single connected component, not total
+    mask area, mirroring remove_small_components — so scattered sub-threshold
+    fragments cannot reset the early-stop counter when they would be fully erased
+    post-hoc. min_mask_px should match min_comp_px used in filter_seed_results.
     """
     for lid, prop_mask in frame_masks.items():
         idx = lid - 1
         if idx >= len(seed_stats) or not prop_mask.any():
             continue
         ss = seed_stats[idx]
+        # Mirror remove_small_components: require at least one component >= min_mask_px.
+        # Checking total area would let four 120 px specks (480 px total) pass when
+        # each component would be erased post-hoc by remove_small_components.
+        n_cc, cc_map = cv2.connectedComponents(prop_mask.astype(np.uint8))
+        largest_cc = max((int((cc_map == i).sum()) for i in range(1, n_cc)), default=0)
+        if largest_cc < min_mask_px:
+            continue
         area = int(prop_mask.sum())
         if area > max_area_ratio * ss["area"]:
             continue
@@ -224,14 +239,11 @@ _OVERLAY_COLORS = [
 
 
 def save_slice_results(frames_dir: Path, all_segs: dict, n_frames: int,
-                       results_dir: Path, ref_sitk=None):
+                       results_dir: Path):
     """
-    Save per-slice visualisation images to results_dir, mirroring the
-    build_volume / extracter pattern:
-        {frame:02d}_result.png   –  3-panel figure (original | overlay | mask)
-        {frame:02d}_mask.png     –  binary mask PNG
-        {frame:02d}_mask.nrrd    –  2-D binary mask with in-plane spatial metadata
-        {frame:02d}_mask.nii.gz  –  same, NIfTI format
+    Save per-slice visualisation images to results_dir:
+        {frame:02d}_result.png  –  3-panel figure (original | overlay | mask)
+        {frame:02d}_mask.png    –  binary mask PNG
     """
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nSaving slice results to {results_dir}/")
@@ -401,14 +413,16 @@ def propagate(
         raw = {f: {} for f in range(n_frames)}
 
         dead = 0
-        for out_f, out_ids, out_logits in predictor.propagate_in_video(inference_state):
+        for out_f, out_ids, out_logits in predictor.propagate_in_video(
+            inference_state, start_frame_idx=seed_frame_idx
+        ):
             frame_masks = {}
             for i, oid in enumerate(out_ids):
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
                 frame_masks[oid] = m
             if out_f != seed_frame_idx:
-                if _frame_passes_filter(frame_masks, seed_stats, max_area_ratio, max_drift):
+                if _frame_passes_filter(frame_masks, seed_stats, max_area_ratio, max_drift, min_comp_px):
                     dead = 0
                 else:
                     dead += 1
@@ -419,7 +433,7 @@ def propagate(
 
         dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
-            inference_state, reverse=True
+            inference_state, start_frame_idx=seed_frame_idx, reverse=True
         ):
             frame_masks = {}
             for i, oid in enumerate(out_ids):
@@ -427,7 +441,7 @@ def propagate(
                 _merge_seg(raw, out_f, oid, m)
                 frame_masks[oid] = m
             if out_f != seed_frame_idx:
-                if _frame_passes_filter(frame_masks, seed_stats, max_area_ratio, max_drift):
+                if _frame_passes_filter(frame_masks, seed_stats, max_area_ratio, max_drift, min_comp_px):
                     dead = 0
                 else:
                     dead += 1
