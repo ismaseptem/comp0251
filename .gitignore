@@ -282,7 +282,7 @@ test*/
 output_test/
 output/
 sam2_input/
-sam2_test/
+sam2/
 sam2_input*/
 slice_results/
 *.nii.gz

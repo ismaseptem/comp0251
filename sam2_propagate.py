@@ -403,28 +403,44 @@ def propagate(
         for lid, m in enumerate(comp_masks, start=1):
             predictor.add_new_mask(inference_state, seed_frame_idx, lid, m)
 
-        # Seed stats used for both inline termination and post-hoc filtering
+        # Seed stats used for both inline termination and post-hoc filtering.
+        # radius_px is the minimum-enclosing-circle radius (≈ half the RECIST long
+        # axis) — a faithful longest-extent measure rather than an area-equivalent
+        # circle, which underestimates the true half-long-axis for elongated lesions.
         seed_stats = []
         for m in comp_masks:
             area = int(m.sum())
             ys, xs = np.where(m)
+            if area:
+                pts = np.column_stack([xs, ys]).astype(np.float32)
+                _, radius_px = cv2.minEnclosingCircle(pts)
+            else:
+                radius_px = 0.0
             seed_stats.append({
                 "area": area,
                 "cx": float(xs.mean()) if area else 0.0,
                 "cy": float(ys.mean()) if area else 0.0,
+                "radius_px": float(radius_px),
             })
 
-        # RECIST-based depth limit: assume tumour is roughly spherical, so its
-        # superior-inferior extent ≈ in-plane diameter. Max propagation depth
-        # (in slices, each direction) = diameter_mm / slice_thickness_mm.
-        # Take the max across components so the largest lesion dictates range;
-        # smaller components are still constrained per-frame by area/drift.
-        max_depth = 1
-        for ss in seed_stats:
-            area_mm2 = ss["area"] * pixel_spacing_mm ** 2
-            radius_mm = np.sqrt(area_mm2 / np.pi)   # seed is at equator → extends by radius each way
-            max_depth = max(max_depth, int(np.ceil(radius_mm / slice_thickness_mm)))
-        print(f"  Max depth (RECIST): ±{max_depth} slices")
+        # RECIST-based depth limit, computed PER LESION (per connected component).
+        # Assume each tumour is roughly spherical, so its superior-inferior extent
+        # ≈ its in-plane radius each way. depth (slices, each direction) =
+        # radius_mm / slice_thickness_mm. The radius is the min-enclosing-circle
+        # radius (≈ half the RECIST long axis), so an elongated lesion is no longer
+        # under-propagated the way an area-equivalent circle radius would.
+        # Each object is bounded by ITS OWN radius, so a small component co-located
+        # with a large one on the same seed frame is no longer dragged out to the
+        # large one's range. The overall loop is bounded by the largest per-object
+        # depth; objects are dropped individually once they pass their own limit
+        # (see the per-object gate in the propagation loops).
+        obj_depth = {}                              # object id (lid) → max depth in slices
+        for lid, ss in enumerate(seed_stats, start=1):
+            radius_mm = ss["radius_px"] * pixel_spacing_mm  # seed at equator → extends ±radius
+            obj_depth[lid] = max(1, int(np.ceil(radius_mm / slice_thickness_mm)))
+        max_depth = max(obj_depth.values())         # loop bound = largest per-object depth
+        depth_str = ", ".join(f"obj{lid}=±{d}" for lid, d in obj_depth.items())
+        print(f"  Max depth (RECIST, per-lesion): {depth_str}  (loop bound ±{max_depth})")
 
         # Collect raw forward + backward results with early termination.
         # Propagation stops at max_depth slices from seed (RECIST geometry) or
@@ -441,6 +457,10 @@ def propagate(
                 break
             frame_masks = {}
             for i, oid in enumerate(out_ids):
+                # Per-lesion gate: drop this object once it exceeds its own depth,
+                # even though larger co-seeded objects keep propagating.
+                if (out_f - seed_frame_idx) > obj_depth.get(oid, max_depth):
+                    continue
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
                 frame_masks[oid] = m
@@ -463,6 +483,10 @@ def propagate(
                 break
             frame_masks = {}
             for i, oid in enumerate(out_ids):
+                # Per-lesion gate: drop this object once it exceeds its own depth,
+                # even though larger co-seeded objects keep propagating.
+                if (seed_frame_idx - out_f) > obj_depth.get(oid, max_depth):
+                    continue
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
                 frame_masks[oid] = m
