@@ -79,10 +79,13 @@ def build_z_map(dcm_dir: Path, tol: float = 0.01) -> dict:
 # ─────────────────────────── Per-slice extraction ────────────────────────
 
 def extract_mask(dcm_path: Path, target_hw: tuple[int, int],
-                 results_dir: Path | None) -> np.ndarray:
+                 results_dir: Path | None, min_arm_len: int = 15) -> np.ndarray:
     """
     Run the extracter on one annotated (ROI) DICOM.
     Returns a uint8 binary mask (0/1) resized to target_hw = (H, W).
+
+    min_arm_len: shortest crosshair arm (px) to accept, forwarded to the
+        extracter (default 15).
     """
     try:
         ds = pydicom.dcmread(str(dcm_path))
@@ -97,7 +100,7 @@ def extract_mask(dcm_path: Path, target_hw: tuple[int, int],
         img_bgr = cv2.cvtColor(arr.astype(np.uint8), cv2.COLOR_RGB2BGR)
 
     _, mask = process_image(dcm_path, output_dir=results_dir, show=False,
-                            image_bgr=img_bgr)
+                            image_bgr=img_bgr, min_arm_len=min_arm_len)
 
     h, w = target_hw
     if mask.shape != (h, w):
@@ -109,12 +112,14 @@ def extract_mask(dcm_path: Path, target_hw: tuple[int, int],
 
 def build_volume(roi_dir: Path, output_path: Path,
                  raw_dir: Path | None = None,
-                 slice_results: Path | None = None):
+                 slice_results: Path | None = None,
+                 min_arm_len: int = 15):
     """
     roi_dir    – folder of annotated Secondary Capture DICOMs (crosshair detection)
     raw_dir    – folder of raw MR DICOMs (slice ordering + spatial metadata for output)
                  If None, spatial metadata comes from the ROI series (SC space).
     output_path – destination NRRD file
+    min_arm_len – shortest crosshair arm (px) to accept during detection (default 15)
     """
 
     # ── Reference series: raw MR if available, else ROI SC ───────────────
@@ -170,7 +175,7 @@ def build_volume(roi_dir: Path, output_path: Path,
             # No raw_dir: ref_path IS the roi path
             roi_path = ref_path
 
-        mask = extract_mask(roi_path, target_hw, slice_results)
+        mask = extract_mask(roi_path, target_hw, slice_results, min_arm_len=min_arm_len)
         label_volume[slice_idx] = mask
 
         has_ann   = bool(mask.any())
@@ -216,6 +221,11 @@ if __name__ == "__main__":
                         help="Output NRRD path (default: label.nrrd)")
     parser.add_argument("--slice-results", default=None,
                         help="Directory to save per-slice detection PNGs (optional)")
+    parser.add_argument("--min-arm-len", type=int, default=15,
+                        help="Shortest crosshair arm to accept, in pixels "
+                             "(default: 15). Lower (~8-10) to recover small "
+                             "tumours whose annotation arms are short; raise to "
+                             "suppress short false detections.")
     args = parser.parse_args()
 
     build_volume(
@@ -223,4 +233,5 @@ if __name__ == "__main__":
         raw_dir=Path(args.raw_dir) if args.raw_dir else None,
         output_path=Path(args.output),
         slice_results=Path(args.slice_results) if args.slice_results else None,
+        min_arm_len=args.min_arm_len,
     )

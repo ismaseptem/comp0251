@@ -171,10 +171,18 @@ def merge_collinear_segments(segs, angle_tol=12, dist_tol=8, max_gap=25):
 
 # ──────────────────────────── Detection pipeline ─────────────────────────
 
-def detect_segments_by_color(image_bgr):
-    """Return {color_name: [seg, ...]} where seg = (x1,y1,x2,y2)."""
+def detect_segments_by_color(image_bgr, min_arm_len=15):
+    """Return {color_name: [seg, ...]} where seg = (x1,y1,x2,y2).
+
+    min_arm_len: shortest crosshair arm (px) to accept. Controls both the
+        Hough minimum line length / vote threshold and the post-merge length
+        filter. Lower it (e.g. 8–10) to recover small tumours whose annotation
+        arms are only ~12 px; raise it to suppress short false detections.
+    """
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     result = {}
+
+    hough_len = max(1, int(round(min_arm_len)))
 
     for color, ranges in COLOR_RANGES.items():
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -190,14 +198,14 @@ def detect_segments_by_color(image_bgr):
 
         lines = cv2.HoughLinesP(
             mask, rho=1, theta=np.pi / 180,
-            threshold=15, minLineLength=15, maxLineGap=10,
+            threshold=hough_len, minLineLength=hough_len, maxLineGap=10,
         )
         if lines is None:
             continue
 
         segs = [tuple(map(float, l[0])) for l in lines]
         segs = merge_collinear_segments(segs)
-        segs = [s for s in segs if seg_len(*s) > 15]
+        segs = [s for s in segs if seg_len(*s) > min_arm_len]
         if segs:
             result[color] = segs
 
@@ -289,10 +297,13 @@ def ellipse_mask(shape, cx, cy, major_len, minor_len, angle_deg):
 
 # ──────────────────────────── Main function ──────────────────────────────
 
-def process_image(image_path, output_dir=None, show=True, image_bgr=None):
+def process_image(image_path, output_dir=None, show=True, image_bgr=None,
+                  min_arm_len=15):
     """
     image_bgr: optional pre-loaded BGR numpy array (e.g. from a DICOM pixel_array).
                When provided, image_path is only used for naming output files.
+    min_arm_len: shortest crosshair arm (px) to accept (default 15). See
+               detect_segments_by_color.
     """
     if image_bgr is not None:
         img_bgr = image_bgr
@@ -304,7 +315,7 @@ def process_image(image_path, output_dir=None, show=True, image_bgr=None):
     h, w = img_bgr.shape[:2]
 
     # ── Step 1: detect segments per color
-    segs_by_color = detect_segments_by_color(img_bgr)
+    segs_by_color = detect_segments_by_color(img_bgr, min_arm_len=min_arm_len)
     print(f"\nColors detected: {list(segs_by_color.keys())}")
     for c, s in segs_by_color.items():
         print(f"  {c:8s}: {len(s)} segment(s)")
@@ -387,10 +398,15 @@ if __name__ == "__main__":
                         help="Skip the interactive matplotlib window")
     parser.add_argument("--tol", type=int, default=30,
                         help="Intersection tolerance in pixels (default: 30)")
+    parser.add_argument("--min-arm-len", type=int, default=15,
+                        help="Shortest crosshair arm to accept, in pixels "
+                             "(default: 15). Lower (~8-10) to recover small "
+                             "tumours; raise to suppress short false lines.")
     args = parser.parse_args()
 
     process_image(
         args.image,
         output_dir=args.output,
         show=not args.no_show,
+        min_arm_len=args.min_arm_len,
     )

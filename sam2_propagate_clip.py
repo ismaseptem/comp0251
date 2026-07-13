@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-sam2_propagate.py — propagate tumor masks across MRI slices using SAM2
+sam2_propagate_clip.py — SHRINKING-ELLIPSE CLIP variant
 -----------------------------------------------------------------------
+Same seeding + per-lesion RECIST depth as sam2_propagate.py, but the post-hoc
+step is pixel CLIPPING rather than whole-frame accept/reject. Each propagated
+slice's mask is intersected with a depth-scaled shrinking ellipse (the fitted
+seed ellipse, tapered toward the poles by sphere geometry); pixels outside are
+removed, the rest kept. There is NO area/drift/shrink/dead-frame frame
+rejection — the only filter retained is small-component noise removal.
+
+    clip ellipse at depth d = seed ellipse scaled by sqrt(1-(d/(max_depth+1))^2) × clip_scale
+
 Reads the frames/ and masks/ produced by prepare_sam2.py, runs SAM2 video
 propagation (forward + backward), and writes a propagated label volume.
 
-Connected components within each mask are each tracked as a separate SAM2
-object. Each seed frame is propagated independently; results are filtered by
-area and centroid proximity then OR-merged into a single binary volume.
-Instance IDs in the output are assigned per-slice and are not matched across
-seeds or slices.
-
 Usage
 -----
-    python sam2_propagate.py \\
-        --sam2-dir  sam2_test/sam2 \\
+    python sam2_propagate_clip.py \\
+        --sam2-dir  sam2 \\
         --input-dir sam2_input \\
         --label     label.nii.gz \\
-        --output    propagated_label.nrrd
-
-    # Faster but less accurate:
-    python sam2_propagate.py ... --model small
+        --output    propagated_label_clip.nrrd
 """
 
 import argparse
@@ -96,128 +96,93 @@ def remove_small_components(mask: np.ndarray, min_px: int) -> np.ndarray:
     return clean
 
 
-def drift_limit_for(radius_px: float, drift_frac: float,
-                    drift_floor: float, drift_cap: float) -> float:
-    """Per-tumour allowed per-step centroid drift, in pixels.
-
-    Scales with the lesion's own radius so a tiny ellipse is held tight while a
-    large mass may shift proportionally: limit = drift_frac × radius_px, clamped
-    to [drift_floor, drift_cap]. A fixed pixel threshold is simultaneously too
-    loose for small lesions and too tight for large ones; this makes the check
-    scale-invariant so it need not be retuned per case.
+def fit_seed_ellipse(comp_mask: np.ndarray):
+    """Fit an ellipse to a seed component. Returns (center_xy, (MA, ma), angle_deg),
+    matching cv2.fitEllipse (axes are FULL lengths). Falls back to the minimum
+    enclosing circle for components too small for fitEllipse (< 5 contour points).
     """
-    return float(min(drift_cap, max(drift_floor, drift_frac * radius_px)))
+    cnts, _ = cv2.findContours(comp_mask.astype(np.uint8),
+                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return (0.0, 0.0), (1.0, 1.0), 0.0
+    cnt = max(cnts, key=cv2.contourArea)
+    if len(cnt) >= 5:
+        (cx, cy), (MA, ma), angle = cv2.fitEllipse(cnt)
+        return (cx, cy), (MA, ma), angle
+    (cx, cy), r = cv2.minEnclosingCircle(cnt)
+    return (cx, cy), (2 * r, 2 * r), 0.0
 
 
-def _object_passes(
-    prop_mask: np.ndarray,
-    seed_stat: dict,
-    prev_cxy: tuple[float, float],
-    prev_area: float,
-    max_area_ratio: float,
-    shrink_factor: float,
-    min_px: int,
-):
-    """Decide whether a single propagated object mask is a plausible continuation.
-
-    Returns (keep: bool, centroid: (cx, cy) | None, area: int).
-
-    Two area anchors are enforced together:
-    - Seed cap (RECIST 'seed is the largest cross-section'): area may not exceed
-      max_area_ratio × seed area. Bounds absolute size against the annotated max.
-    - Per-step shrink (vs the PREVIOUS accepted slice): area may not exceed
-      shrink_factor × prev_area, so the cross-section keeps getting smaller moving
-      outward instead of holding constant. prev_area is the seed area on the first
-      step. The seed cap bounds absolute size; the shrink factor bounds the trend.
-
-    Drift is the per-STEP centroid displacement from prev_cxy (the last accepted
-    slice, or the seed centroid on the first step), thresholded per-tumour via
-    seed_stat["drift_limit"]. Catches a single large jump while allowing gradual
-    migration. The min-size gate checks the largest connected component (mirrors
-    remove_small_components) so sub-threshold fragments can't keep a frame alive.
-    """
-    if not prop_mask.any():
-        return False, None, 0
-    n_cc, cc_map = cv2.connectedComponents(prop_mask.astype(np.uint8))
-    largest_cc = max((int((cc_map == i).sum()) for i in range(1, n_cc)), default=0)
-    if largest_cc < min_px:
-        return False, None, 0
-    area = int(prop_mask.sum())
-    if area > max_area_ratio * seed_stat["area"]:      # seed cap (absolute size)
-        return False, None, 0
-    if area > shrink_factor * prev_area:               # per-step shrink (trend)
-        return False, None, 0
-    ys, xs = np.where(prop_mask)
-    cxy = (float(xs.mean()), float(ys.mean()))
-    if np.hypot(cxy[0] - prev_cxy[0], cxy[1] - prev_cxy[1]) > seed_stat["drift_limit"]:
-        return False, None, 0
-    return True, cxy, area
+def shrunk_ellipse_mask(H: int, W: int, ellipse, scale: float) -> np.ndarray:
+    """Rasterise the seed ellipse scaled about its own centre by `scale` (0..1)."""
+    (cx, cy), (MA, ma), angle = ellipse
+    m = np.zeros((H, W), dtype=np.uint8)
+    ax = max(1, int(round(MA / 2.0 * scale)))
+    ay = max(1, int(round(ma / 2.0 * scale)))
+    cv2.ellipse(m, (int(round(cx)), int(round(cy))), (ax, ay),
+                angle, 0, 360, color=1, thickness=-1)
+    return m.astype(bool)
 
 
-def filter_seed_results(
+def clip_seed_results(
     raw: dict,
     seed_frame_idx: int,
-    seed_stats: list[dict],
-    max_area_ratio: float,
-    shrink_factor: float,
+    seed_ellipses: list,
+    obj_depth: dict,
+    H: int,
+    W: int,
+    clip_scale: float = 1.0,
     min_comp_px: int = 200,
 ) -> dict:
     """
-    Keep only propagated masks that are plausible extensions of the seed.
+    CLIP variant of the post-hoc filter — NO whole-frame accept/reject.
 
-    Each object is walked OUTWARD from the seed frame (forward then backward),
-    tracking the last accepted centroid AND area so drift and shrinkage are
-    measured slice-to-slice rather than against the fixed seed. Per-slice rules
-    (see _object_passes):
-      - Area  ≤ max_area_ratio × seed area         (seed cap, absolute size)
-      - Area  ≤ shrink_factor × previous area       (per-step shrink trend)
-      - Centroid step ≤ seed_stat["drift_limit"] px (per-tumour, vs previous slice)
-      - Connected components < min_comp_px pixels are stripped
+    For every propagated slice, the mask is CLIPPED to a depth-scaled shrinking
+    ellipse (the seed ellipse shrunk by sphere geometry) instead of being kept or
+    rejected wholesale. Pixels outside the shrinking ellipse are removed; the rest
+    is kept. This is idea-1 "reject pixels that leave the seed shape, keep the rest"
+    with the seed shape tapering toward the poles.
 
-    seed_stats carries the precomputed per-object area/centroid/radius/drift_limit
-    (built once in propagate). The seed frame itself is kept unchanged.
+      scale(d) = sqrt(1 - (d / (max_depth+1))^2) · clip_scale   (sphere cross-section)
+
+    The only filter retained is noise removal (remove_small_components); there is
+    no area/drift/shrink/dead-frame frame rejection. The seed frame is kept as-is.
 
     Returns {frame_idx: binary_bool_mask}.
     """
-    frames = sorted(raw.keys())
-    if not frames:
-        return {}
-    lo, hi = frames[0], frames[-1]
-
     result: dict = {}
 
     def _add(frame_idx, mask):
         existing = result.get(frame_idx)
         result[frame_idx] = mask if existing is None else (existing | mask)
 
-    for lid, ss in enumerate(seed_stats, start=1):
-        # Seed frame: keep SAM2's seed-frame reconstruction unchanged (ground-truth).
+    for lid, ell in enumerate(seed_ellipses, start=1):
+        # Seed frame kept unchanged (it is the annotation itself).
         seed_mask = raw.get(seed_frame_idx, {}).get(lid)
         if seed_mask is not None and seed_mask.any():
             _add(seed_frame_idx, seed_mask)
 
-        # Walk each direction independently, comparing to the last accepted slice.
-        for step in (1, -1):
-            prev_cxy = (ss["cx"], ss["cy"])
-            prev_area = ss["area"]
-            f = seed_frame_idx + step
-            while lo <= f <= hi:
-                prop_mask = raw.get(f, {}).get(lid)
-                if prop_mask is None:          # past this object's recorded range
-                    break
-                keep, cxy, area = _object_passes(
-                    prop_mask, ss, prev_cxy, prev_area,
-                    max_area_ratio, shrink_factor, min_comp_px
-                )
-                if keep:
-                    cleaned = remove_small_components(prop_mask, min_comp_px)
-                    if cleaned.any():
-                        _add(f, cleaned)
-                        prev_cxy = cxy         # advance references to this accepted slice
-                        prev_area = area
-                # A failed slice is skipped but does not advance prev_cxy/prev_area, so
-                # the next slice is still measured against the last good one.
-                f += step
+        maxd = max(1, obj_depth.get(lid, 1))
+        for frame_idx, obj_masks in raw.items():
+            if frame_idx == seed_frame_idx:
+                continue
+            prop_mask = obj_masks.get(lid)
+            if prop_mask is None or not prop_mask.any():
+                continue
+            d = abs(frame_idx - seed_frame_idx)
+            if d > maxd:
+                continue
+            # Taper to zero at maxd+1 (not maxd) so the last in-range slice
+            # (d == maxd) still has a non-zero cross-section. With the old
+            # (d/maxd) form, a depth-1 lesion got scale=0 at d=1 and vanished on
+            # the very next slice even though SAM2 propagated it there.
+            scale = np.sqrt(max(0.0, 1.0 - (d / (maxd + 1)) ** 2)) * clip_scale
+            if scale <= 0.0:
+                continue
+            clipped = prop_mask & shrunk_ellipse_mask(H, W, ell, scale)
+            clipped = remove_small_components(clipped, min_comp_px)  # noise removal kept
+            if clipped.any():
+                _add(frame_idx, clipped)
 
     return {k: v for k, v in result.items() if v.any()}
 
@@ -347,13 +312,8 @@ def propagate(
     label_path: Path,
     output_path: Path,
     model: str = "large",
-    max_area_ratio: float = 1.1,
-    shrink_factor: float = 1.0,
-    drift_frac: float = 0.5,
-    drift_floor: float = 5.0,
-    max_drift: float = 150.0,
-    min_comp_px: int = 200,
-    max_dead_frames: int = 5,
+    clip_scale: float = 1.0,
+    min_comp_px: int = 20,
     slice_results_dir: Path | None = None,
 ):
     device     = select_device()
@@ -367,9 +327,8 @@ def propagate(
     if not annotated_frames:
         raise FileNotFoundError(f"No mask PNGs found in {masks_dir}")
     print(f"\nAnnotated frames : {annotated_frames}")
-    print(f"Filters          : max_area_ratio={max_area_ratio}  shrink_factor={shrink_factor}  "
-          f"drift={drift_frac}×radius (floor {drift_floor}px, cap {max_drift}px)  "
-          f"max_dead_frames={max_dead_frames}")
+    print(f"Mode             : ellipse-clip (no frame rejection)  "
+          f"clip_scale={clip_scale}  min_comp_px={min_comp_px} (noise removal kept)")
 
     # ── Spatial metadata (used for depth estimation and output writing) ───
     ref = sitk.ReadImage(str(label_path))
@@ -408,9 +367,8 @@ def propagate(
 
     # ── Per-seed-frame independent propagation ────────────────────────────
     # Each annotated frame is propagated independently (forward + backward).
-    # Results are filtered by area and centroid proximity before OR-merging.
-    # This prevents an unusually large mask on one frame from biasing the
-    # propagation context for every other frame.
+    # Each propagated mask is CLIPPED to a depth-scaled shrinking ellipse (no
+    # whole-frame rejection) before OR-merging into the output volume.
     all_binary = np.zeros((n_frames, H, W), dtype=bool)
 
     for seed_num, seed_frame_idx in enumerate(annotated_frames):
@@ -431,144 +389,60 @@ def propagate(
         for lid, m in enumerate(comp_masks, start=1):
             predictor.add_new_mask(inference_state, seed_frame_idx, lid, m)
 
-        # Seed stats used for both inline termination and post-hoc filtering.
-        # radius_px is the minimum-enclosing-circle radius (≈ half the RECIST long
-        # axis) — a faithful longest-extent measure rather than an area-equivalent
-        # circle, which underestimates the true half-long-axis for elongated lesions.
-        seed_stats = []
-        for m in comp_masks:
-            area = int(m.sum())
-            ys, xs = np.where(m)
-            if area:
-                pts = np.column_stack([xs, ys]).astype(np.float32)
-                _, radius_px = cv2.minEnclosingCircle(pts)
-            else:
-                radius_px = 0.0
-            seed_stats.append({
-                "area": area,
-                "cx": float(xs.mean()) if area else 0.0,
-                "cy": float(ys.mean()) if area else 0.0,
-                "radius_px": float(radius_px),
-                "drift_limit": drift_limit_for(radius_px, drift_frac,
-                                               drift_floor, max_drift),
-            })
-
-        # RECIST-based depth limit, computed PER LESION (per connected component).
-        # Assume each tumour is roughly spherical, so its superior-inferior extent
-        # ≈ its in-plane radius each way. depth (slices, each direction) =
-        # radius_mm / slice_thickness_mm. The radius is the min-enclosing-circle
-        # radius (≈ half the RECIST long axis), so an elongated lesion is no longer
-        # under-propagated the way an area-equivalent circle radius would.
-        # Each object is bounded by ITS OWN radius, so a small component co-located
-        # with a large one on the same seed frame is no longer dragged out to the
-        # large one's range. The overall loop is bounded by the largest per-object
-        # depth; objects are dropped individually once they pass their own limit
-        # (see the per-object gate in the propagation loops).
+        # Per-lesion RECIST depth + fitted seed ellipse (the shape we clip to).
+        # radius_px is the min-enclosing-circle radius (≈ half the RECIST long axis);
+        # depth (slices, each direction) = radius_mm / slice_thickness_mm. Each object
+        # is bounded by its own radius; the loop is bounded by the largest depth.
         obj_depth = {}                              # object id (lid) → max depth in slices
-        for lid, ss in enumerate(seed_stats, start=1):
-            radius_mm = ss["radius_px"] * pixel_spacing_mm  # seed at equator → extends ±radius
-            obj_depth[lid] = max(1, int(np.ceil(radius_mm / slice_thickness_mm)))
+        seed_ellipses = []                          # object id order → fitted ellipse
+        for m in comp_masks:
+            ys, xs = np.where(m)
+            pts = np.column_stack([xs, ys]).astype(np.float32)
+            _, radius_px = cv2.minEnclosingCircle(pts)
+            radius_mm = radius_px * pixel_spacing_mm
+            obj_depth[len(seed_ellipses) + 1] = max(1, int(np.ceil(radius_mm / slice_thickness_mm)))
+            seed_ellipses.append(fit_seed_ellipse(m))
         max_depth = max(obj_depth.values())         # loop bound = largest per-object depth
         depth_str = ", ".join(f"obj{lid}=±{d}" for lid, d in obj_depth.items())
         print(f"  Max depth (RECIST, per-lesion): {depth_str}  (loop bound ±{max_depth})")
-        drift_str = ", ".join(f"obj{lid}={ss['drift_limit']:.0f}px"
-                              for lid, ss in enumerate(seed_stats, start=1))
-        print(f"  Drift limit  (per-lesion)     : {drift_str}")
 
-        # Collect raw forward + backward results with early termination.
-        # Propagation stops at max_depth slices from seed (RECIST geometry) or
-        # after max_dead_frames consecutive failures (tracking lost), whichever
-        # comes first.
+        # Collect raw forward + backward results, bounded only by RECIST depth.
+        # NO dead-frame early-stop / accept-reject filtering in this variant — the
+        # shrinking-ellipse clip does the containment instead.
         raw = {f: {} for f in range(n_frames)}
 
-        # Per-object last-accepted centroid, so the inline dead-frame check measures
-        # drift slice-to-slice (matching filter_seed_results) rather than vs the seed.
-        prev_cxy = {lid: (ss["cx"], ss["cy"]) for lid, ss in enumerate(seed_stats, start=1)}
-        prev_area = {lid: ss["area"] for lid, ss in enumerate(seed_stats, start=1)}
-        dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, start_frame_idx=seed_frame_idx
         ):
             if out_f > seed_frame_idx + max_depth:
                 print(f"  → Fwd depth limit at frame {out_f}")
                 break
-            frame_masks = {}
             for i, oid in enumerate(out_ids):
-                # Per-lesion gate: drop this object once it exceeds its own depth,
-                # even though larger co-seeded objects keep propagating.
                 if (out_f - seed_frame_idx) > obj_depth.get(oid, max_depth):
-                    continue
+                    continue                        # per-lesion depth gate
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
-                frame_masks[oid] = m
-            if out_f != seed_frame_idx:
-                passed = False
-                for oid, m in frame_masks.items():
-                    if oid - 1 >= len(seed_stats):
-                        continue
-                    ok, cxy, area = _object_passes(m, seed_stats[oid - 1], prev_cxy[oid],
-                                                   prev_area[oid], max_area_ratio,
-                                                   shrink_factor, min_comp_px)
-                    if ok:
-                        prev_cxy[oid] = cxy
-                        prev_area[oid] = area
-                        passed = True
-                if passed:
-                    dead = 0
-                else:
-                    dead += 1
-                    if dead >= max_dead_frames:
-                        print(f"  → Fwd early-stop at frame {out_f} "
-                              f"({dead} consecutive dead frames)")
-                        break
 
-        prev_cxy = {lid: (ss["cx"], ss["cy"]) for lid, ss in enumerate(seed_stats, start=1)}
-        prev_area = {lid: ss["area"] for lid, ss in enumerate(seed_stats, start=1)}
-        dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, start_frame_idx=seed_frame_idx, reverse=True
         ):
             if out_f < seed_frame_idx - max_depth:
                 print(f"  → Bwd depth limit at frame {out_f}")
                 break
-            frame_masks = {}
             for i, oid in enumerate(out_ids):
-                # Per-lesion gate: drop this object once it exceeds its own depth,
-                # even though larger co-seeded objects keep propagating.
                 if (seed_frame_idx - out_f) > obj_depth.get(oid, max_depth):
-                    continue
+                    continue                        # per-lesion depth gate
                 m = (out_logits[i] > 0.0).cpu().numpy().squeeze()
                 _merge_seg(raw, out_f, oid, m)
-                frame_masks[oid] = m
-            if out_f != seed_frame_idx:
-                passed = False
-                for oid, m in frame_masks.items():
-                    if oid - 1 >= len(seed_stats):
-                        continue
-                    ok, cxy, area = _object_passes(m, seed_stats[oid - 1], prev_cxy[oid],
-                                                   prev_area[oid], max_area_ratio,
-                                                   shrink_factor, min_comp_px)
-                    if ok:
-                        prev_cxy[oid] = cxy
-                        prev_area[oid] = area
-                        passed = True
-                if passed:
-                    dead = 0
-                else:
-                    dead += 1
-                    if dead >= max_dead_frames:
-                        print(f"  → Bwd early-stop at frame {out_f} "
-                              f"({dead} consecutive dead frames)")
-                        break
 
-        # Filter and accumulate
-        filtered = filter_seed_results(raw, seed_frame_idx, seed_stats,
-                                       max_area_ratio, shrink_factor, min_comp_px)
+        # Clip to the shrinking ellipse and accumulate (noise removal kept).
+        clipped = clip_seed_results(raw, seed_frame_idx, seed_ellipses, obj_depth,
+                                    H, W, clip_scale, min_comp_px)
         covered = 0
-        for frame_idx, bin_mask in filtered.items():
+        for frame_idx, bin_mask in clipped.items():
             all_binary[frame_idx] |= bin_mask
             covered += 1
-        print(f"  → frames covered after filtering: {covered}")
+        print(f"  → frames covered after clipping: {covered}")
 
     # ── Final cleanup: remove tiny fragments that survived OR-merging ────
     # Seed (annotated) frames are EXEMPT: their small components are real
@@ -634,43 +508,22 @@ if __name__ == "__main__":
                         help="Directory with frames/ and masks/ (default: sam2_input)")
     parser.add_argument("--label",      required=True,
                         help="Original label file for spatial metadata (.nii.gz or .nrrd)")
-    parser.add_argument("--output",     default="propagated_label.nrrd",
-                        help="Output NRRD path (default: propagated_label.nrrd)")
+    parser.add_argument("--output",     default="propagated_label_clip.nrrd",
+                        help="Output NRRD path (default: propagated_label_clip.nrrd)")
     parser.add_argument("--model",      default="large",
                         choices=["tiny", "small", "base_plus", "large"],
                         help="SAM2.1 model size (default: large)")
-    parser.add_argument("--max-area-ratio", type=float, default=1.1,
-                        help="Seed cap: reject propagated masks whose area exceeds this "
-                             "multiple of the SEED mask area (default: 1.1). Bounds absolute "
-                             "size against the annotated max cross-section; 1.1 gives 10%% "
-                             "tolerance for segmentation imprecision.")
-    parser.add_argument("--shrink-factor", type=float, default=1.0,
-                        help="Per-step shrink: reject a propagated mask whose area exceeds "
-                             "this multiple of the PREVIOUS accepted slice's area "
-                             "(default: 1.0 = must not grow outward). Forces the cross-section "
-                             "to keep shrinking toward the poles instead of holding constant. "
-                             "Raise slightly (e.g. 1.05) to tolerate segmentation noise.")
-    parser.add_argument("--drift-frac", type=float, default=0.5,
-                        help="Per-tumour per-step drift tolerance as a fraction of the "
-                             "lesion radius (default: 0.5). A mask is rejected when its "
-                             "centroid jumps more than drift_frac × radius from the PREVIOUS "
-                             "accepted slice, so a small ellipse is held tight while a large "
-                             "mass may shift proportionally. Catches SAM2 latching onto a "
-                             "neighbour while allowing gradual slice-to-slice migration.")
-    parser.add_argument("--drift-floor", type=float, default=5.0,
-                        help="Minimum per-step drift tolerance in pixels (default: 5), so "
-                             "tiny lesions still get some slack.")
-    parser.add_argument("--max-drift", type=float, default=150.0,
-                        help="Absolute cap on the per-tumour per-step drift tolerance in "
-                             "pixels (default: 150).")
-    parser.add_argument("--min-comp-px", type=int, default=200,
+    parser.add_argument("--clip-scale", type=float, default=1.0,
+                        help="Multiplier on the shrinking-ellipse size (default: 1.0). "
+                             "The clip ellipse at depth d is the seed ellipse scaled by "
+                             "sqrt(1-(d/max_depth)^2) × clip_scale. Raise above 1.0 to keep "
+                             "more pixels (looser clip); lower to clip tighter.")
+    parser.add_argument("--min-comp-px", type=int, default=20,
                         help="Remove connected components smaller than this many pixels "
-                             "from propagated masks (default: 200). Eliminates spurious "
-                             "tiny fragments from SAM2 without affecting tumour regions.")
-    parser.add_argument("--max-dead-frames", type=int, default=5,
-                        help="Stop propagating from a seed when this many consecutive "
-                             "frames all fail the area/drift filter (default: 5). "
-                             "Prevents SAM2 hidden-state corruption from distant frames.")
+                             "AFTER clipping (default: 20, matching the seed-loading "
+                             "threshold so a lesion good enough to seed can also survive "
+                             "propagation). This is the only filter kept — noise removal, "
+                             "not frame rejection. Use 0 to keep every speck.")
     parser.add_argument("--slice-results", default=None, metavar="DIR",
                         help="If set, save per-slice overlay + mask PNGs to this "
                              "directory (mirrors build_volume / extracter output).")
@@ -682,12 +535,7 @@ if __name__ == "__main__":
         label_path=Path(args.label),
         output_path=Path(args.output),
         model=args.model,
-        max_area_ratio=args.max_area_ratio,
-        shrink_factor=args.shrink_factor,
-        drift_frac=args.drift_frac,
-        drift_floor=args.drift_floor,
-        max_drift=args.max_drift,
+        clip_scale=args.clip_scale,
         min_comp_px=args.min_comp_px,
-        max_dead_frames=args.max_dead_frames,
         slice_results_dir=Path(args.slice_results) if args.slice_results else None,
     )

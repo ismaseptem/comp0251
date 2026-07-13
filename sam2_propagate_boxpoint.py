@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 """
-sam2_propagate.py — propagate tumor masks across MRI slices using SAM2
+sam2_propagate_boxpoint.py — BOX+POINT seeding variant
 -----------------------------------------------------------------------
+Identical to sam2_propagate.py except for how SAM2 is seeded: instead of
+forcing the filled RECIST ellipse via add_new_mask, each component is prompted
+with its bounding box + a positive centroid point (add_new_points_or_box), so
+SAM2 segments the tumour from image features rather than inheriting the ellipse
+shape. All downstream logic (per-lesion depth, per-tumour drift, area filter,
+OR-merge) is unchanged, so outputs are directly comparable to sam2_propagate.py.
+
 Reads the frames/ and masks/ produced by prepare_sam2.py, runs SAM2 video
 propagation (forward + backward), and writes a propagated label volume.
 
-Connected components within each mask are each tracked as a separate SAM2
-object. Each seed frame is propagated independently; results are filtered by
-area and centroid proximity then OR-merged into a single binary volume.
-Instance IDs in the output are assigned per-slice and are not matched across
-seeds or slices.
-
 Usage
 -----
-    python sam2_propagate.py \\
-        --sam2-dir  sam2_test/sam2 \\
+    python sam2_propagate_boxpoint.py \\
+        --sam2-dir  sam2 \\
         --input-dir sam2_input \\
         --label     label.nii.gz \\
-        --output    propagated_label.nrrd
+        --output    propagated_label_boxpoint.nrrd
 
     # Faster but less accurate:
-    python sam2_propagate.py ... --model small
+    python sam2_propagate_boxpoint.py ... --model small
 """
 
 import argparse
@@ -113,45 +114,37 @@ def _object_passes(
     prop_mask: np.ndarray,
     seed_stat: dict,
     prev_cxy: tuple[float, float],
-    prev_area: float,
     max_area_ratio: float,
-    shrink_factor: float,
     min_px: int,
 ):
     """Decide whether a single propagated object mask is a plausible continuation.
 
-    Returns (keep: bool, centroid: (cx, cy) | None, area: int).
+    Returns (keep: bool, centroid: (cx, cy) | None).
 
-    Two area anchors are enforced together:
-    - Seed cap (RECIST 'seed is the largest cross-section'): area may not exceed
-      max_area_ratio × seed area. Bounds absolute size against the annotated max.
-    - Per-step shrink (vs the PREVIOUS accepted slice): area may not exceed
-      shrink_factor × prev_area, so the cross-section keeps getting smaller moving
-      outward instead of holding constant. prev_area is the seed area on the first
-      step. The seed cap bounds absolute size; the shrink factor bounds the trend.
-
-    Drift is the per-STEP centroid displacement from prev_cxy (the last accepted
-    slice, or the seed centroid on the first step), thresholded per-tumour via
-    seed_stat["drift_limit"]. Catches a single large jump while allowing gradual
-    migration. The min-size gate checks the largest connected component (mirrors
-    remove_small_components) so sub-threshold fragments can't keep a frame alive.
+    - Area is compared against the SEED component (RECIST 'seed is the largest
+      cross-section, so it only shrinks' assumption — this stays anchored to the seed).
+    - Drift is the per-STEP centroid displacement from prev_cxy: the last accepted
+      slice for this object, or the seed centroid on the first step away from it.
+      The threshold is per-tumour (seed_stat["drift_limit"], scaled by the lesion's
+      radius). This catches a single large jump (SAM2 latching onto a neighbouring
+      structure) while allowing a tumour to migrate gradually across many slices.
+    - The min-size gate checks the largest connected component (mirrors
+      remove_small_components) so scattered sub-threshold fragments can't keep a
+      frame alive.
     """
     if not prop_mask.any():
-        return False, None, 0
+        return False, None
     n_cc, cc_map = cv2.connectedComponents(prop_mask.astype(np.uint8))
     largest_cc = max((int((cc_map == i).sum()) for i in range(1, n_cc)), default=0)
     if largest_cc < min_px:
-        return False, None, 0
-    area = int(prop_mask.sum())
-    if area > max_area_ratio * seed_stat["area"]:      # seed cap (absolute size)
-        return False, None, 0
-    if area > shrink_factor * prev_area:               # per-step shrink (trend)
-        return False, None, 0
+        return False, None
+    if int(prop_mask.sum()) > max_area_ratio * seed_stat["area"]:
+        return False, None
     ys, xs = np.where(prop_mask)
     cxy = (float(xs.mean()), float(ys.mean()))
     if np.hypot(cxy[0] - prev_cxy[0], cxy[1] - prev_cxy[1]) > seed_stat["drift_limit"]:
-        return False, None, 0
-    return True, cxy, area
+        return False, None
+    return True, cxy
 
 
 def filter_seed_results(
@@ -159,19 +152,16 @@ def filter_seed_results(
     seed_frame_idx: int,
     seed_stats: list[dict],
     max_area_ratio: float,
-    shrink_factor: float,
     min_comp_px: int = 200,
 ) -> dict:
     """
     Keep only propagated masks that are plausible extensions of the seed.
 
     Each object is walked OUTWARD from the seed frame (forward then backward),
-    tracking the last accepted centroid AND area so drift and shrinkage are
-    measured slice-to-slice rather than against the fixed seed. Per-slice rules
-    (see _object_passes):
-      - Area  ≤ max_area_ratio × seed area         (seed cap, absolute size)
-      - Area  ≤ shrink_factor × previous area       (per-step shrink trend)
-      - Centroid step ≤ seed_stat["drift_limit"] px (per-tumour, vs previous slice)
+    tracking the last accepted centroid so drift is measured slice-to-slice rather
+    than against the fixed seed. Per-slice rules (see _object_passes):
+      - Area  ≤ max_area_ratio × seed component area   (vs seed)
+      - Centroid step ≤ seed_stat["drift_limit"] px    (per-tumour, vs previous slice)
       - Connected components < min_comp_px pixels are stripped
 
     seed_stats carries the precomputed per-object area/centroid/radius/drift_limit
@@ -196,27 +186,24 @@ def filter_seed_results(
         if seed_mask is not None and seed_mask.any():
             _add(seed_frame_idx, seed_mask)
 
-        # Walk each direction independently, comparing to the last accepted slice.
+        # Walk each direction independently, comparing to the last accepted centroid.
         for step in (1, -1):
             prev_cxy = (ss["cx"], ss["cy"])
-            prev_area = ss["area"]
             f = seed_frame_idx + step
             while lo <= f <= hi:
                 prop_mask = raw.get(f, {}).get(lid)
                 if prop_mask is None:          # past this object's recorded range
                     break
-                keep, cxy, area = _object_passes(
-                    prop_mask, ss, prev_cxy, prev_area,
-                    max_area_ratio, shrink_factor, min_comp_px
+                keep, cxy = _object_passes(
+                    prop_mask, ss, prev_cxy, max_area_ratio, min_comp_px
                 )
                 if keep:
                     cleaned = remove_small_components(prop_mask, min_comp_px)
                     if cleaned.any():
                         _add(f, cleaned)
-                        prev_cxy = cxy         # advance references to this accepted slice
-                        prev_area = area
-                # A failed slice is skipped but does not advance prev_cxy/prev_area, so
-                # the next slice is still measured against the last good one.
+                        prev_cxy = cxy         # advance reference to this accepted slice
+                # A failed slice is skipped but does not advance prev_cxy, so the next
+                # slice is still measured against the last good position.
                 f += step
 
     return {k: v for k, v in result.items() if v.any()}
@@ -348,7 +335,6 @@ def propagate(
     output_path: Path,
     model: str = "large",
     max_area_ratio: float = 1.1,
-    shrink_factor: float = 1.0,
     drift_frac: float = 0.5,
     drift_floor: float = 5.0,
     max_drift: float = 150.0,
@@ -367,7 +353,7 @@ def propagate(
     if not annotated_frames:
         raise FileNotFoundError(f"No mask PNGs found in {masks_dir}")
     print(f"\nAnnotated frames : {annotated_frames}")
-    print(f"Filters          : max_area_ratio={max_area_ratio}  shrink_factor={shrink_factor}  "
+    print(f"Filters          : max_area_ratio={max_area_ratio}  "
           f"drift={drift_frac}×radius (floor {drift_floor}px, cap {max_drift}px)  "
           f"max_dead_frames={max_dead_frames}")
 
@@ -427,9 +413,24 @@ def propagate(
         print(f"\n[{seed_num+1}/{len(annotated_frames)}] frame {seed_frame_idx}: "
               f"{len(comp_masks)} component(s)  areas={areas}")
 
+        # BOX+POINT seeding variant: instead of forcing SAM2 to the filled RECIST
+        # ellipse (add_new_mask), prompt it with the ellipse's bounding box plus a
+        # positive point at the centroid and let SAM2 segment the tumour from image
+        # features. This avoids the elliptical-blob shape bias of the mask prompt.
+        # Everything downstream (seed_stats, depth, drift, area filters) is unchanged
+        # and still derived from the ellipse, so this is a clean A/B vs sam2_propagate.py.
         predictor.reset_state(inference_state)
         for lid, m in enumerate(comp_masks, start=1):
-            predictor.add_new_mask(inference_state, seed_frame_idx, lid, m)
+            ys, xs = np.where(m)
+            box = np.array([int(xs.min()), int(ys.min()),
+                            int(xs.max()), int(ys.max())], dtype=np.float32)
+            point = np.array([[float(xs.mean()), float(ys.mean())]], dtype=np.float32)
+            predictor.add_new_points_or_box(
+                inference_state, seed_frame_idx, lid,
+                points=point,
+                labels=np.array([1], dtype=np.int32),   # 1 = positive (foreground)
+                box=box,
+            )
 
         # Seed stats used for both inline termination and post-hoc filtering.
         # radius_px is the minimum-enclosing-circle radius (≈ half the RECIST long
@@ -484,7 +485,6 @@ def propagate(
         # Per-object last-accepted centroid, so the inline dead-frame check measures
         # drift slice-to-slice (matching filter_seed_results) rather than vs the seed.
         prev_cxy = {lid: (ss["cx"], ss["cy"]) for lid, ss in enumerate(seed_stats, start=1)}
-        prev_area = {lid: ss["area"] for lid, ss in enumerate(seed_stats, start=1)}
         dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, start_frame_idx=seed_frame_idx
@@ -506,12 +506,10 @@ def propagate(
                 for oid, m in frame_masks.items():
                     if oid - 1 >= len(seed_stats):
                         continue
-                    ok, cxy, area = _object_passes(m, seed_stats[oid - 1], prev_cxy[oid],
-                                                   prev_area[oid], max_area_ratio,
-                                                   shrink_factor, min_comp_px)
+                    ok, cxy = _object_passes(m, seed_stats[oid - 1], prev_cxy[oid],
+                                             max_area_ratio, min_comp_px)
                     if ok:
                         prev_cxy[oid] = cxy
-                        prev_area[oid] = area
                         passed = True
                 if passed:
                     dead = 0
@@ -523,7 +521,6 @@ def propagate(
                         break
 
         prev_cxy = {lid: (ss["cx"], ss["cy"]) for lid, ss in enumerate(seed_stats, start=1)}
-        prev_area = {lid: ss["area"] for lid, ss in enumerate(seed_stats, start=1)}
         dead = 0
         for out_f, out_ids, out_logits in predictor.propagate_in_video(
             inference_state, start_frame_idx=seed_frame_idx, reverse=True
@@ -545,12 +542,10 @@ def propagate(
                 for oid, m in frame_masks.items():
                     if oid - 1 >= len(seed_stats):
                         continue
-                    ok, cxy, area = _object_passes(m, seed_stats[oid - 1], prev_cxy[oid],
-                                                   prev_area[oid], max_area_ratio,
-                                                   shrink_factor, min_comp_px)
+                    ok, cxy = _object_passes(m, seed_stats[oid - 1], prev_cxy[oid],
+                                             max_area_ratio, min_comp_px)
                     if ok:
                         prev_cxy[oid] = cxy
-                        prev_area[oid] = area
                         passed = True
                 if passed:
                     dead = 0
@@ -563,7 +558,7 @@ def propagate(
 
         # Filter and accumulate
         filtered = filter_seed_results(raw, seed_frame_idx, seed_stats,
-                                       max_area_ratio, shrink_factor, min_comp_px)
+                                       max_area_ratio, min_comp_px)
         covered = 0
         for frame_idx, bin_mask in filtered.items():
             all_binary[frame_idx] |= bin_mask
@@ -571,12 +566,8 @@ def propagate(
         print(f"  → frames covered after filtering: {covered}")
 
     # ── Final cleanup: remove tiny fragments that survived OR-merging ────
-    # Seed (annotated) frames are EXEMPT: their small components are real
-    # ground-truth annotations, not SAM2 noise, so they must survive even when
-    # below min_comp_px. Only propagated (non-annotated) frames get the cull.
-    annotated_set = set(annotated_frames)
     for f in range(n_frames):
-        if all_binary[f].any() and f not in annotated_set:
+        if all_binary[f].any():
             all_binary[f] = remove_small_components(all_binary[f], min_comp_px)
 
     # ── Optional per-slice result images ─────────────────────────────────
@@ -634,22 +625,16 @@ if __name__ == "__main__":
                         help="Directory with frames/ and masks/ (default: sam2_input)")
     parser.add_argument("--label",      required=True,
                         help="Original label file for spatial metadata (.nii.gz or .nrrd)")
-    parser.add_argument("--output",     default="propagated_label.nrrd",
-                        help="Output NRRD path (default: propagated_label.nrrd)")
+    parser.add_argument("--output",     default="propagated_label_boxpoint.nrrd",
+                        help="Output NRRD path (default: propagated_label_boxpoint.nrrd)")
     parser.add_argument("--model",      default="large",
                         choices=["tiny", "small", "base_plus", "large"],
                         help="SAM2.1 model size (default: large)")
     parser.add_argument("--max-area-ratio", type=float, default=1.1,
-                        help="Seed cap: reject propagated masks whose area exceeds this "
-                             "multiple of the SEED mask area (default: 1.1). Bounds absolute "
-                             "size against the annotated max cross-section; 1.1 gives 10%% "
-                             "tolerance for segmentation imprecision.")
-    parser.add_argument("--shrink-factor", type=float, default=1.0,
-                        help="Per-step shrink: reject a propagated mask whose area exceeds "
-                             "this multiple of the PREVIOUS accepted slice's area "
-                             "(default: 1.0 = must not grow outward). Forces the cross-section "
-                             "to keep shrinking toward the poles instead of holding constant. "
-                             "Raise slightly (e.g. 1.05) to tolerate segmentation noise.")
+                        help="Reject propagated masks whose area exceeds this multiple "
+                             "of the seed mask area (default: 1.1). Seeds are the largest "
+                             "cross-section, so propagated slices should only get smaller; "
+                             "1.1 gives 10%% tolerance for segmentation imprecision.")
     parser.add_argument("--drift-frac", type=float, default=0.5,
                         help="Per-tumour per-step drift tolerance as a fraction of the "
                              "lesion radius (default: 0.5). A mask is rejected when its "
@@ -683,7 +668,6 @@ if __name__ == "__main__":
         output_path=Path(args.output),
         model=args.model,
         max_area_ratio=args.max_area_ratio,
-        shrink_factor=args.shrink_factor,
         drift_frac=args.drift_frac,
         drift_floor=args.drift_floor,
         max_drift=args.max_drift,

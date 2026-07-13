@@ -281,7 +281,8 @@ tags
 test*/
 output_test/
 output/
-sam2_input/
+slices*/
+nnunet/
 sam2/
 sam2_input*/
 slice_results/
