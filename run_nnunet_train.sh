@@ -28,7 +28,7 @@
 #$ -cwd
 
 # ── User-defined config (edit these) ─────────────────────────────────────────
-CONDA_ENV="comp0251"
+CONDA_ENV="comp0251-gpu"
 DATASET_ID=501
 DATASET_NAME="Tumour"
 FOLDS=5
@@ -39,7 +39,8 @@ TRAINER="nnUNetTrainer"          # or nnUNetTrainer_250epochs for a fast first l
 export nnUNet_raw="$HOME/comp0251/nnUNet_raw"
 export nnUNet_preprocessed="$HOME/comp0251/nnUNet_preprocessed"
 export nnUNet_results="$HOME/comp0251/nnUNet_results"
-export nnUNet_n_proc_DA=8         # data-augmentation workers; match -pe smp above
+export nnUNet_n_proc_DA=4         # data-augmentation workers; 8 deadlocked at spawn on Myriad (limited /dev/shm)
+export nnUNet_compile=f           # disable torch.compile — it hung indefinitely before Epoch 0 on Myriad GPU nodes
 
 # ── Map SGE_TASK_ID → (config, fold) ─────────────────────────────────────────
 idx=$((SGE_TASK_ID - 1))
