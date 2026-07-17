@@ -39,11 +39,14 @@ TRAINER="nnUNetTrainer"          # or nnUNetTrainer_250epochs for a fast first l
 export nnUNet_raw="$HOME/comp0251/nnUNet_raw"
 export nnUNet_preprocessed="$HOME/comp0251/nnUNet_preprocessed"
 export nnUNet_results="$HOME/comp0251/nnUNet_results"
-export nnUNet_n_proc_DA=0         # 0 = SingleThreadedAugmenter (no worker processes). The multithreaded
-                                  # augmenter deadlocks at first-batch on Myriad even with 126G /dev/shm free.
+export nnUNet_n_proc_DA=4         # parallel augmentation workers, to keep the GPU fed. (Earlier "deadlocks"
+                                  # were just buffered stdout, not real hangs — see PYTHONUNBUFFERED below.)
 export nnUNet_compile=f           # disable torch.compile — it hung indefinitely before Epoch 0 on Myriad GPU nodes
-export OMP_NUM_THREADS=1          # cap BLAS/OpenMP threads — thread over-subscription deadlocks at fork
+export OMP_NUM_THREADS=1          # cap BLAS/OpenMP threads (harmless with DA=0; kept for safety)
 export MKL_NUM_THREADS=1
+export PYTHONUNBUFFERED=1         # flush stdout immediately — batch stdout is block-buffered, which
+                                  # made healthy training look "stuck" in the SGE .log (it wasn't).
+                                  # nnU-Net's own fold_*/training_log_*.txt is the authoritative progress log.
 
 # ── Map SGE_TASK_ID → (config, fold) ─────────────────────────────────────────
 idx=$((SGE_TASK_ID - 1))
