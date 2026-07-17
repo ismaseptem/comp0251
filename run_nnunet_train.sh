@@ -83,6 +83,9 @@ elif [ -f "$FOLD_DIR/checkpoint_latest.pth" ]; then
     echo "resuming from checkpoint_latest.pth"; RESUME="--c"
 fi
 
+# diagnostic: prove the DA/compile fix is actually in effect + show shared-mem size
+echo "DIAG compile=$nnUNet_compile  DA=$nnUNet_n_proc_DA  shm=$(df -h /dev/shm | tail -1)"
+
 nnUNetv2_train "$DATASET_ID" "$CONFIG" "$fold" -tr "$TRAINER" $RESUME
 
 echo "==== Done $CONFIG fold $fold: $(date) ===="
