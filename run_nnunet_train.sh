@@ -39,8 +39,11 @@ TRAINER="nnUNetTrainer"          # or nnUNetTrainer_250epochs for a fast first l
 export nnUNet_raw="$HOME/comp0251/nnUNet_raw"
 export nnUNet_preprocessed="$HOME/comp0251/nnUNet_preprocessed"
 export nnUNet_results="$HOME/comp0251/nnUNet_results"
-export nnUNet_n_proc_DA=4         # data-augmentation workers; 8 deadlocked at spawn on Myriad (limited /dev/shm)
+export nnUNet_n_proc_DA=0         # 0 = SingleThreadedAugmenter (no worker processes). The multithreaded
+                                  # augmenter deadlocks at first-batch on Myriad even with 126G /dev/shm free.
 export nnUNet_compile=f           # disable torch.compile — it hung indefinitely before Epoch 0 on Myriad GPU nodes
+export OMP_NUM_THREADS=1          # cap BLAS/OpenMP threads — thread over-subscription deadlocks at fork
+export MKL_NUM_THREADS=1
 
 # ── Map SGE_TASK_ID → (config, fold) ─────────────────────────────────────────
 idx=$((SGE_TASK_ID - 1))
