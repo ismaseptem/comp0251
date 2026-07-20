@@ -76,13 +76,20 @@ def make_figure(case, img, gt, pred, zs, out_path):
     return True
 
 
+def _case_of(m):
+    """Case id from a summary.json metric_per_case entry (schema-robust)."""
+    for key in ("prediction_file", "reference_file"):
+        if m.get(key):
+            return Path(m[key]).name.split(".")[0]
+    raise KeyError("no prediction_file/reference_file in summary entry")
+
+
 def resolve_cases(args):
     if args.cases:
         return list(args.cases)
     if args.summary:
         d = json.load(open(args.summary))
-        rows = sorted((m["metrics"]["1"]["Dice"],
-                       Path(m["reference"]).name.split(".")[0])
+        rows = sorted((m["metrics"]["1"]["Dice"], _case_of(m))
                       for m in d["metric_per_case"])
         picked = [c for _, c in rows[: args.auto]] + [c for _, c in rows[-args.auto:]]
         return list(dict.fromkeys(picked))          # de-dup, keep order
