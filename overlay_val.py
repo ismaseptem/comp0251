@@ -39,9 +39,16 @@ def load(p):
 
 
 def pick_slices(gt, pred, n):
-    """Slice indices with the most tumour (union of gt+pred), up to n."""
+    """Slice indices to render.
+
+    n <= 0  → every slice that has tumour in gt OR pred (whole-volume view).
+    n  > 0  → the n slices with the most tumour (union of gt+pred).
+    """
     fg = ((gt > 0) | (pred > 0))
     per_z = fg.reshape(fg.shape[0], -1).sum(1)
+    tumour_zs = [int(z) for z in range(fg.shape[0]) if per_z[z] > 0]
+    if n is None or n <= 0:
+        return tumour_zs                       # all tumour-bearing slices, in order
     zs = np.argsort(per_z)[::-1]
     zs = [int(z) for z in zs if per_z[z] > 0][:n]
     return sorted(zs)
@@ -53,22 +60,28 @@ def dice(a, b):
     return 1.0 if d == 0 else 2.0 * (a & b).sum() / d
 
 
-def make_figure(case, img, gt, pred, zs, out_path):
+def make_figure(case, img, gt, pred, zs, out_path, ncols=6):
+    """Render the given slices as a grid montage (green = GT, red = prediction)."""
     n = len(zs)
     if n == 0:
         return False
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
-    for ax, z in zip(axes[0], zs):
+    ncols = min(ncols, n)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows),
+                             squeeze=False)
+    for ax, z in zip(axes.ravel(), zs):
         sl = img[z].astype(float)
         lo, hi = np.percentile(sl, [1, 99])
         ax.imshow(np.clip(sl, lo, hi), cmap="gray")
         if (gt[z] > 0).any():
-            ax.contour(gt[z] > 0, colors="lime", linewidths=1.2)
+            ax.contour(gt[z] > 0, colors="lime", linewidths=1.0)
         if (pred[z] > 0).any():
-            ax.contour(pred[z] > 0, colors="red", linewidths=1.2)
-        ax.set_title(f"slice {z}", fontsize=9)
+            ax.contour(pred[z] > 0, colors="red", linewidths=1.0)
+        ax.set_title(f"slice {z}", fontsize=8)
         ax.axis("off")
-    fig.suptitle(f"{case}   Dice={dice(gt, pred):.3f}   "
+    for ax in axes.ravel()[n:]:          # blank any unused grid cells
+        ax.axis("off")
+    fig.suptitle(f"{case}   Dice={dice(gt, pred):.3f}   ({n} tumour slices)   "
                  "green = SAM2 label, red = nnU-Net", fontsize=11)
     fig.tight_layout()
     fig.savefig(out_path, dpi=130, bbox_inches="tight")

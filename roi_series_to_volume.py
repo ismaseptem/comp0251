@@ -104,27 +104,48 @@ def _window(raw_vol):
     return lo, hi
 
 
+def _caption(img, text):
+    """Write a small caption in the top-left corner of a BGR image (in place)."""
+    cv2.putText(img, text, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (255, 255, 255), 1, cv2.LINE_AA)
+
+
 def _save_slice_png(out_dir, z, gray8, lines, ellipses, mask, inst=None, scale=2):
-    """One QC overlay: MR (grey) + filled mask (red) + axis lines (green) +
-    ellipse outlines (yellow)."""
+    """Side-by-side QC comparison, saved as one PNG:
+        left  — original MR + original ROI axis lines (green)
+        right — original MR + extracted ellipse outlines (yellow) over the
+                filled mask (red).
+    """
     bg = cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+    zt = f"z={z}" + (f" inst={inst}" if inst is not None else "")
+
+    # ── Left panel: original DICOM with the original ROI crosshair lines ──
+    left = bg.copy()
+    for (a, b) in lines:
+        cv2.line(left, (int(round(a[0])), int(round(a[1]))),
+                 (int(round(b[0])), int(round(b[1]))), (0, 255, 0), 1)
+
+    # ── Right panel: original DICOM with the extracted ellipses + mask ───
     ov = bg.copy()
     ov[mask > 0] = (0, 0, 255)
-    out = cv2.addWeighted(bg, 0.6, ov, 0.4, 0)
-    for (a, b) in lines:
-        cv2.line(out, (int(round(a[0])), int(round(a[1]))),
-                 (int(round(b[0])), int(round(b[1]))), (0, 255, 0), 1)
+    right = cv2.addWeighted(bg, 0.6, ov, 0.4, 0)
     for cx, cy, maj, mnr, ang in ellipses:
-        cv2.ellipse(out, (int(round(cx)), int(round(cy))),
+        cv2.ellipse(right, (int(round(cx)), int(round(cy))),
                     (max(1, int(round(maj / 2))), max(1, int(round(mnr / 2)))),
                     ang, 0, 360, (0, 255, 255), 1)
+
     if scale != 1:
-        out = cv2.resize(out, None, fx=scale, fy=scale,
-                         interpolation=cv2.INTER_NEAREST)
-    tag = f"z={z}" + (f" inst={inst}" if inst is not None else "") + \
-          f"  {len(ellipses)} tumour(s)"
-    cv2.putText(out, tag, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                (255, 255, 255), 1, cv2.LINE_AA)
+        left = cv2.resize(left, None, fx=scale, fy=scale,
+                          interpolation=cv2.INTER_NEAREST)
+        right = cv2.resize(right, None, fx=scale, fy=scale,
+                           interpolation=cv2.INTER_NEAREST)
+
+    _caption(left,  f"{zt}  original ROIs")
+    _caption(right, f"{len(ellipses)} tumour(s)  extracted ellipses")
+
+    # Thin separator column between the two panels.
+    sep = np.full((left.shape[0], 2, 3), 64, dtype=np.uint8)
+    out = np.hstack([left, sep, right])
     cv2.imwrite(str(out_dir / f"slice_{z:03d}.png"), out)
 
 
@@ -280,8 +301,9 @@ if __name__ == "__main__":
     ap.add_argument("--compare", default=None,
                     help="Existing label (NRRD/NIfTI) to report IoU / slice overlap.")
     ap.add_argument("--slice-results", default=None,
-                    help="Directory to save per-slice QC overlay PNGs "
-                         "(MR + axis lines + ellipse outlines + mask).")
+                    help="Directory to save per-slice QC comparison PNGs "
+                         "(left: MR + original ROI lines; right: MR + extracted "
+                         "ellipse outlines + mask).")
     ap.add_argument("--no-square-correct", action="store_true",
                     help="Disable the square-acquisition→reconstructed-grid "
                          "aspect correction of ROI coordinates.")
