@@ -27,6 +27,13 @@ CLIP_SCALE=1.0                          # shrinking-ellipse size multiplier
 MIN_COMP_PX=20                          # noise cull; matches seed threshold (keeps small lesions)
 
 # ── Pick this task's case from the manifest ──────────────────────────────────
+# Guard an unset/blank SGE_TASK_ID first: without it `sed -n "p"` prints EVERY
+# line and the -z check below would pass the multi-line blob straight through
+# (the same footgun that ran nnU-Net's job as "fold -1"). Submit with the array
+# flag BEFORE the script:  qsub -t 1-N run_sam2_array.sh  (not ... run_... -t 1-N).
+if ! [[ "$SGE_TASK_ID" =~ ^[0-9]+$ ]]; then
+    echo "SGE_TASK_ID is '$SGE_TASK_ID', not a task number. Submit as: qsub -t 1-N $0"; exit 1
+fi
 case="$(sed -n "${SGE_TASK_ID}p" "$BASE/cases.txt")"
 if [ -z "$case" ]; then
     echo "No case on line $SGE_TASK_ID of $BASE/cases.txt"; exit 1
