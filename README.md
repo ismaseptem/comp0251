@@ -261,12 +261,16 @@ nnUNetv2_predict -i imagesTs -o preds -d 502 -c 3d_fullres -f 0 1 2 3 4
 # -> preds/newcase.nii.gz  (binary tumour mask on the input grid)
 ```
 
-**Trained model.** The five fold checkpoints are ~235 MB each (~1.2 GB total), too
-large for the git repo. They are not committed here; if released, they are hosted
-separately (e.g. Zenodo / Hugging Face) and linked from this section. To use them,
-unpack into `nnUNet_results/Dataset502_Tumour/` keeping nnU-Net's folder layout
-(`nnUNetTrainer__nnUNetPlans__3d_fullres/fold_*/checkpoint_final.pth` + `plans.json`
-+ `dataset.json`).
+**Trained model.** The five fold checkpoints (~235 MB each, ~1.1 GB total) are too
+large for the git repo, so they are hosted on UCL storage (access restricted to
+UCL accounts):
+
+- **Download:** https://liveuclac.sharepoint.com/:u:/s/COMP0251_Alasgarov_Nik_Aznan/IQB-ENdUNsepQ6LvuVppSa7EAUAISLGVRHxKoAjEktyYiwo?e=udhqFR
+- **File:** `Dataset502_Tumour.zip` · SHA-256 `61044f5a3326078f3e81daa0391f0e0aefacf93d32a67f73ab135a6120b9382f`
+
+Unpack it into `nnUNet_results/` so the layout is
+`nnUNet_results/Dataset502_Tumour/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_*/checkpoint_final.pth`
+(alongside `plans.json` + `dataset.json`), then run the §6 prediction command.
 
 ---
 
