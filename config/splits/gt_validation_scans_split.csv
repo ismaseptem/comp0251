@@ -1,0 +1,11 @@
+#,case,cv_fold,burden_stratum,burden_mm3,n_lesions,slices_with_lesion,current_dice_nnunet_vs_sam2,note,old_cv_fold
+1,brac62451c_03,0,LOW,87.1,21,25,0.8118,,0
+2,dabj201c_01,4,LOW,65.5,6,19,0.0,nnU-Net predicted nothing (label 6626 vox),0
+3,brac62721b_00,1,HIGH,1098.7,26,34,0.7631,,1
+4,brac51681a_01,1,LOW,28.1,4,11,0.0618,nnU-Net over-predicted 21x (60833 vs 2845 vox),1
+5,brac62731a_01,3,MID,578.4,46,41,0.7628,,2
+6,dabj171d_02,4,MID,340.4,51,37,0.7577,,2
+7,brac52351a_01,2,MID,262.4,23,31,0.7856,,3
+8,brac52351d_00,2,LOW,31.1,16,21,0.7758,,3
+9,brac54131f_00,3,HIGH,1470.0,36,49,0.795,,4
+10,dabj91c_02,0,LOW,24.8,8,12,0.8043,,4
