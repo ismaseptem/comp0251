@@ -25,6 +25,8 @@
 # Icon must end with two \r
 Icon
 
+# Claude
+.claude
 
 # Thumbnails
 ._*
@@ -224,12 +226,7 @@ pyrightconfig.json
 ### venv ###
 # Virtualenv
 # http://iamzed.com/2009/05/07/a-primer-on-virtualenv/
-[Bb]in
-[Ii]nclude
-[Ll]ib
-[Ll]ib64
-[Ll]ocal
-[Ss]cripts
+# (venv layout patterns removed — [Ss]cripts/[Bb]in/etc. collide with source dirs)
 pyvenv.cfg
 pip-selfcheck.json
 
@@ -288,3 +285,5 @@ sam2_input*/
 slice_results/
 *.nii.gz
 *.nrrd
+data/
+nnUNet*/

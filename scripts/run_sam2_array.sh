@@ -1,12 +1,8 @@
 #!/bin/bash -l
 # run_sam2_array.sh — SGE array job: one SAM2 propagation task per case.
-# Reads case names from $BASE/cases.txt (line N = task N), so submit with the
-# array size matched to the manifest:
-#
-#     qsub -t 1-$(wc -l < $HOME/comp0251/pipeline_out/cases.txt) run_sam2_array.sh
-#
-# Each task consumes the locally-prepared inputs (frames/ + seed masks/) and
-# writes  $BASE/out/<case>_propagated.nrrd  plus per-slice QC PNGs.
+# Reads $BASE/cases.txt (line N = task N); submit with the array size matched to
+# the manifest:  qsub -t 1-$(wc -l < .../cases.txt) run_sam2_array.sh
+# Writes $BASE/out/<case>_propagated.nrrd + per-slice QC PNGs.
 #$ -S /bin/bash
 #$ -N sam2_prop
 #$ -l h_rt=2:00:00
@@ -27,10 +23,8 @@ CLIP_SCALE=1.0                          # shrinking-ellipse size multiplier
 MIN_COMP_PX=20                          # noise cull; matches seed threshold (keeps small lesions)
 
 # ── Pick this task's case from the manifest ──────────────────────────────────
-# Guard an unset/blank SGE_TASK_ID first: without it `sed -n "p"` prints EVERY
-# line and the -z check below would pass the multi-line blob straight through
-# (the same footgun that ran nnU-Net's job as "fold -1"). Submit with the array
-# flag BEFORE the script:  qsub -t 1-N run_sam2_array.sh  (not ... run_... -t 1-N).
+# Guard an unset/blank SGE_TASK_ID first (else `sed -n "p"` prints every line).
+# Submit with the array flag BEFORE the script:  qsub -t 1-N run_sam2_array.sh.
 if ! [[ "$SGE_TASK_ID" =~ ^[0-9]+$ ]]; then
     echo "SGE_TASK_ID is '$SGE_TASK_ID', not a task number. Submit as: qsub -t 1-N $0"; exit 1
 fi

@@ -1,7 +1,10 @@
-torch
-torchvision
-numpy
-matplotlib
-simpleitk
-opencv-python
-pydicom
+torch==2.12.1
+torchvision==0.27.1
+numpy==2.5.0
+scipy==1.18.0
+opencv-python==4.13.0.92        # headless clusters: opencv-python-headless==4.13.0.92
+SimpleITK==2.5.5
+pydicom==3.0.2
+matplotlib==3.11.0
+pillow==12.2.0
+nnunetv2==2.8.1                 # only needed for nnU-Net training/prediction

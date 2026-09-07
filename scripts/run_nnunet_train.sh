@@ -1,20 +1,12 @@
 #!/bin/bash -l
 # run_nnunet_train.sh — SGE array job: train nnU-Net v2, one task per (config, fold).
-# ---------------------------------------------------------------------------
-# The array index selects a configuration + CV fold from CONFIGS × {0..FOLDS-1}:
-#     task 1..5   -> 3d_fullres  folds 0..4
-#     task 6..10  -> 2d          folds 0..4      (only if CONFIGS has both)
-# Submit with the array size = (#CONFIGS × FOLDS):
+# Array index selects a config × CV fold from CONFIGS × {0..FOLDS-1}, e.g.
+# task 1..5 = 3d_fullres folds 0..4, task 6..10 = 2d folds 0..4. Submit with the
+# array size = (#CONFIGS × FOLDS):  qsub -t 1-10 run_nnunet_train.sh
 #
-#     qsub -t 1-10 run_nnunet_train.sh          # both configs, 5 folds each
-#     qsub -t 1-5  run_nnunet_train.sh          # just the first config
-#
-# ONE-TIME prep before the FIRST submit (CPU, run on a login/interactive node):
-#     export nnUNet_raw=... nnUNet_preprocessed=... nnUNet_results=...
-#     nnUNetv2_plan_and_preprocess -d 501 --verify_dataset_integrity
-#     # inject the patient-grouped split (nnU-Net wrote its own random one):
-#     cp "$nnUNet_raw/Dataset501_Tumour/splits_final.json" \
-#        "$nnUNet_preprocessed/Dataset501_Tumour/splits_final.json"
+# One-time prep (CPU, before the first submit): nnUNetv2_plan_and_preprocess -d 501
+# --verify_dataset_integrity, then copy the patient-grouped splits_final.json from
+# nnUNet_raw/Dataset501_Tumour/ into nnUNet_preprocessed/Dataset501_Tumour/.
 #
 #$ -S /bin/bash
 #$ -N nnunet_tr

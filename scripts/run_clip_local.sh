@@ -1,23 +1,11 @@
 #!/usr/bin/env bash
 # run_clip_local.sh — run SAM2 clip propagation on every prepared case, LOCALLY.
-# ---------------------------------------------------------------------------
-# Loops the extraction output (build_dataset.sh: cases.txt + sam2_input/ +
-# labels/) and runs sam2_propagate_clip.py on each case, sequentially, with the
-# chosen model (default: small — fits a laptop GPU/MPS for an overnight run).
-# Each case writes  <BASE>/out/<case>_clip.nrrd  + per-slice QC PNGs, and a full
-# log under <BASE>/logs/. Cases already done are skipped so you can resume after
-# an interrupt (set FORCE=1 to redo them).
+# Loops build_dataset.sh output (cases.txt + sam2_input/ + labels/) and runs
+# sam2_propagate_clip.py per case, writing <BASE>/out/<case>_clip.nrrd + QC PNGs
+# + logs. Done cases are skipped (FORCE=1 to redo).
 #
-# Usage:
-#   ./run_clip_local.sh [BASE] [MODEL]
-#     BASE  = extraction output dir (default: ~/Downloads/output)
-#     MODEL = tiny|small|base_plus|large   (default: small)
-#   Env overrides: SAM2_DIR (./sam2)  CLIP_SCALE (1.0)  MIN_COMP_PX (20)  FORCE (0)
-#
-# Examples:
-#   ./run_clip_local.sh                                  # small, ~/Downloads/output
-#   ./run_clip_local.sh ~/Downloads/output tiny          # faster, rougher
-#   FORCE=1 ./run_clip_local.sh                          # recompute everything
+# Usage:  ./run_clip_local.sh [BASE=~/Downloads/output] [MODEL=small]
+#   Env: SAM2_DIR (./sam2)  CLIP_SCALE (1.0)  MIN_COMP_PX (20)  FORCE (0)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
